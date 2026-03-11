@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+.env
+
+# Node.js
+node_modules/
+.next/
+out/
+.npm
+
+# Docker volumes
+paper_trade_data/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Results (keep structure, ignore actual results)
+backtest/results/*.json
+
+# Environment
+.env.local
+.env.*.local

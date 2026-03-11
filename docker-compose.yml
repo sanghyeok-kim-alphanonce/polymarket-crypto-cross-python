@@ -1,0 +1,410 @@
+# poly-coin-test: 멀티 프로세스 아키텍처
+# P1(rtds) + P2(binance_ws) + P4(paper_trader) + multi_exchange_stream
+
+services:
+  # ============================================================================
+  # Database
+  # ============================================================================
+  paper_trade_db:
+    image: postgres:15-alpine
+    container_name: cointest-paper-trade-db
+    ports:
+      - "5435:5432"
+    environment:
+      POSTGRES_USER: paper
+      POSTGRES_PASSWORD: papertrade
+      POSTGRES_DB: paper_trade
+    volumes:
+      - ./paper_trade_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U paper -d paper_trade"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ============================================================================
+  # Redis (대시보드 + 프로세스간 IPC pub/sub)
+  # ============================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: cointest-redis
+    ports:
+      - "6380:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ============================================================================
+  # P1: RTDS (Real-Time Data Service)
+  # - Polymarket CLOB WebSocket: 오더북 실시간 수집
+  # - Polymarket RTDS WebSocket: Binance/Chainlink 실시간 가격
+  # - Chainlink REST API: 가격 수집 fallback (10초마다)
+  # - Redis pub/sub: ch:orderbook:*, ch:candle_boundary publish
+  # ============================================================================
+  rtds:
+    build:
+      context: .
+      dockerfile: services/rtds/Dockerfile
+    container_name: cointest-rtds
+    depends_on:
+      paper_trade_db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      PYTHONUNBUFFERED: "1"
+      DB_HOST: paper_trade_db
+      DB_PORT: 5432
+      DB_NAME: paper_trade
+      DB_USER: paper
+      DB_PASSWORD: papertrade
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/healthy"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+
+  # ============================================================================
+  # P2: Binance WebSocket
+  # - miniTicker: 실시간 가격
+  # - kline_1m: 1분봉 OHLCV
+  # - Redis pub/sub: ch:candle:* publish
+  # ============================================================================
+  binance_ws:
+    build:
+      context: .
+      dockerfile: services/binance_ws/Dockerfile
+    container_name: cointest-binance-ws
+    depends_on:
+      paper_trade_db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      PYTHONUNBUFFERED: "1"
+      DB_HOST: paper_trade_db
+      DB_PORT: 5432
+      DB_NAME: paper_trade
+      DB_USER: paper
+      DB_PASSWORD: papertrade
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/healthy"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+
+  # ============================================================================
+  # P4: Paper Trader - V12.5 전략
+  # - Redis subscribe: ch:orderbook:*, ch:candle_boundary
+  # - Event-driven 전략 실행 (v12_5)
+  # - 60초 주기 정산
+  # - 기본 실행됨 (profiles 없음)
+  # ============================================================================
+  paper_trader_v12_5:
+    build:
+      context: .
+      dockerfile: services/paper_trader/Dockerfile
+    container_name: cointest-paper-trader-v12-5
+    depends_on:
+      paper_trade_db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rtds:
+        condition: service_started
+    environment:
+      PYTHONUNBUFFERED: "1"
+      # 인프라 (컨테이너 네트워크)
+      DB_HOST: paper_trade_db
+      DB_PORT: 5432
+      DB_NAME: paper_trade
+      DB_USER: paper
+      DB_PASSWORD: papertrade
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # 전략 선택 (파라미터는 strategy_config 기본값 사용)
+      STRATEGY_NAME: v12_5
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/healthy"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+
+  # ============================================================================
+  # P4: Paper Trader - V12.6 전략 (Momentum Match)
+  # - V12.5 기반 + delta 방향 == distance 방향 체크
+  # - ~90% 승률 목표
+  # ============================================================================
+  paper_trader_v12_6:
+    build:
+      context: .
+      dockerfile: services/paper_trader/Dockerfile
+    container_name: cointest-paper-trader-v12-6
+    depends_on:
+      paper_trade_db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rtds:
+        condition: service_started
+    environment:
+      PYTHONUNBUFFERED: "1"
+      # 인프라 (컨테이너 네트워크)
+      DB_HOST: paper_trade_db
+      DB_PORT: 5432
+      DB_NAME: paper_trade
+      DB_USER: paper
+      DB_PASSWORD: papertrade
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # 전략 선택 (파라미터는 strategy_config 기본값 사용)
+      STRATEGY_NAME: v12_6
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/healthy"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+
+  # ============================================================================
+  # ============================================================================
+  # P4-Cross-V2: Paper Trader - Crossing V2 Strategy (무제한)
+  # - Redis subscribe: ch:crossing:*, ch:orderbook:*
+  # - 15분봉 시작가 crossing 시 방향 베팅
+  # - V2: 횟수 제한 없음, 14분까지 베팅
+  # ============================================================================
+  paper_trader_cross_v2:
+    build:
+      context: .
+      dockerfile: services/paper_trader_cross_v2/Dockerfile
+    container_name: cointest-paper-trader-cross-v2
+    depends_on:
+      paper_trade_db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rtds:
+        condition: service_started
+      binance_ws:
+        condition: service_started
+    environment:
+      PYTHONUNBUFFERED: "1"
+      # 인프라 (컨테이너 네트워크)
+      DB_HOST: paper_trade_db
+      DB_PORT: 5432
+      DB_NAME: paper_trade
+      DB_USER: paper
+      DB_PASSWORD: papertrade
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # 전략 파라미터는 config.py 기본값 사용
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/healthy"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+
+  # ============================================================================
+  # real_crossing_v2: 13분30초~14분30초 첫 Crossing 전략
+  # - BTC only, GTC 주문, 동적 가격
+  # - 텔레그램 알림
+  # ============================================================================
+  real_crossing_v2:
+    build:
+      context: .
+      dockerfile: services/real_trader_cross/Dockerfile
+    container_name: cointest-real-crossing-v2
+    depends_on:
+      paper_trade_db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rtds:
+        condition: service_started
+      binance_ws:
+        condition: service_started
+    environment:
+      PYTHONUNBUFFERED: "1"
+      # 인프라 (컨테이너 네트워크)
+      DB_HOST: paper_trade_db
+      DB_PORT: 5432
+      DB_NAME: paper_trade
+      DB_USER: paper
+      DB_PASSWORD: papertrade
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # Credentials (.env에서 가져옴)
+      POLYMARKET_PRIVATE_KEY: ${POLYMARKET_PRIVATE_KEY:-}
+      POLYMARKET_PROXY_ADDRESS: ${POLYMARKET_PROXY_ADDRESS:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      # 전략 파라미터는 config.py 기본값 사용
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/healthy"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+    profiles:
+      - real  # 기본 실행 안함, docker compose --profile real up 으로 실행
+
+  # ============================================================================
+  # real_trader_cross_limit_hedge: Crossing 전략 (횟수 제한 + 헤지)
+  # - BTC only, 15분봉 전체 진입
+  # - 1회차: 4 contracts, 2~9회차: 8 contracts, 10회차: 4 contracts
+  # - GTC 고정 0.70
+  # ============================================================================
+  real_trader_cross_limit_hedge:
+    build:
+      context: .
+      dockerfile: services/real_trader_cross_limit_hedge/Dockerfile
+    container_name: cointest-real-trader-cross-limit-hedge
+    depends_on:
+      paper_trade_db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rtds:
+        condition: service_started
+      binance_ws:
+        condition: service_started
+    environment:
+      PYTHONUNBUFFERED: "1"
+      # 인프라 (컨테이너 네트워크)
+      DB_HOST: paper_trade_db
+      DB_PORT: 5432
+      DB_NAME: paper_trade
+      DB_USER: paper
+      DB_PASSWORD: papertrade
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # Credentials (.env에서 가져옴)
+      POLYMARKET_PRIVATE_KEY: ${POLYMARKET_PRIVATE_KEY:-}
+      POLYMARKET_PROXY_ADDRESS: ${POLYMARKET_PROXY_ADDRESS:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      # 전략 파라미터는 config.py 기본값 사용
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/healthy"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+    profiles:
+      - real  # docker compose --profile real up 으로 실행
+
+  # ============================================================================
+  # Claimer: Auto-claim resolved Polymarket positions
+  # - 별도 프로세스로 resolved trades claim
+  # - Builder Relayer를 통해 redeemPositions 호출
+  # ============================================================================
+  claimer:
+    build:
+      context: .
+      dockerfile: services/claimer/Dockerfile
+    container_name: cointest-claimer
+    environment:
+      PYTHONUNBUFFERED: "1"
+      # Builder API (claim용) - 필수
+      BUILDER_API_KEY_1: ${BUILDER_API_KEY_1:-}
+      BUILDER_SECRET_1: ${BUILDER_SECRET_1:-}
+      BUILDER_PASS_PHRASE_1: ${BUILDER_PASS_PHRASE_1:-}
+      # Account 1 - 필수
+      ACCOUNT_1_PRIVATE_KEY: ${POLYMARKET_PRIVATE_KEY:-}
+      ACCOUNT_1_PROXY_ADDRESS: ${POLYMARKET_PROXY_ADDRESS:-}
+      ACCOUNT_1_NAME: main
+      # 설정
+      CLAIM_INTERVAL: 300
+      # Telegram 알림
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    restart: unless-stopped
+    profiles:
+      - real  # docker compose --profile real up 으로 실행
+
+  # ============================================================================
+  # Multi Exchange Stream (Bybit, Gate, Bitget)
+  # - ccxt.pro WebSocket으로 실시간 가격/오더북 수집
+  # - exchange_prices 테이블에 저장
+  # - Redis에 실시간 캐싱
+  # ============================================================================
+  multi_exchange_stream:
+    build:
+      context: .
+      dockerfile: services/multi_exchange_stream/Dockerfile
+    container_name: cointest-multi-exchange
+    depends_on:
+      paper_trade_db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      PYTHONUNBUFFERED: "1"
+      DB_HOST: paper_trade_db
+      DB_PORT: 5432
+      DB_NAME: paper_trade
+      DB_USER: paper
+      DB_PASSWORD: papertrade
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    restart: unless-stopped
+
+  # ============================================================================
+  # Backtest API (FastAPI)
+  # - paper_trader의 strategies/ 코드를 공유하여 백테스트 실행
+  # - 대시보드 /backtest 페이지에서 호출
+  # ============================================================================
+  backtest_api:
+    build:
+      context: .
+      dockerfile: services/backtest_api/Dockerfile
+    container_name: cointest-backtest-api
+    ports:
+      - "3842:8000"
+    depends_on:
+      paper_trade_db:
+        condition: service_healthy
+    environment:
+      PYTHONUNBUFFERED: "1"
+      # 인프라 (컨테이너 네트워크)
+      DB_HOST: paper_trade_db
+      DB_PORT: 5432
+      DB_NAME: paper_trade
+      DB_USER: paper
+      DB_PASSWORD: papertrade
+      # 전략 파라미터는 strategy_config 기본값 사용
+    restart: unless-stopped
+
+  # ============================================================================
+  # Dozzle: Docker 로그 뷰어
+  # ============================================================================
+  dozzle:
+    image: amir20/dozzle:latest
+    container_name: cointest-dozzle
+    ports:
+      - "3841:8080"
+    environment:
+      DOZZLE_BASE: /logs
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped

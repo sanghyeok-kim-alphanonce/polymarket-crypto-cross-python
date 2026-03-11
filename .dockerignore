@@ -1,0 +1,33 @@
+# Data volumes
+paper_trade_data/
+
+# Node.js
+dashboard/node_modules/
+dashboard/.next/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# IDE & OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Git
+.git/
+.gitignore
+
+# Logs & artifacts
+*.log
+backtest/results/
+
+# Claude
+.claude/

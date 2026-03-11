@@ -1,0 +1,1217 @@
+"""
+Real Trader Cross Limit Hedge: Crossing 전략 (횟수 제한 + 헤지)
+
+- 15분봉 전체 crossing에 진입
+- 10회 제한
+- 1회차: UNIT (10), 2~9회차: 2*UNIT (20), 10회차: UNIT (10) + hedge x HEDGE_UNIT (30)
+- GTC 고정 0.70
+- Redis subscribe: ch:crossing:*, ch:orderbook:*, ch:candle_boundary:15m
+- 텔레그램 알림
+- BTC only
+"""
+import asyncio
+import json
+import time
+from collections import defaultdict
+from datetime import datetime, timezone, timedelta
+from typing import Dict, Optional, Tuple, Any
+from dataclasses import dataclass
+
+import aiohttp
+
+from config import (
+    STRATEGY_NAME, COINS, TIMEFRAMES,
+    CROSSING_BET_CONTRACT_UNIT, CROSSING_HEDGE_UNIT,
+    CROSSING_MAX_COUNT, CROSSING_MIN_ELAPSED_SECONDS, CROSSING_CUTOFF_SECONDS,
+    CROSSING_HEDGE_MIN_REMAINING_SECONDS,
+    get_gtc_price, GTC_HEDGE_PRICE,
+    POLYMARKET_HOST, POLYMARKET_CHAIN_ID,
+    POLYMARKET_PRIVATE_KEY, POLYMARKET_PROXY_ADDRESS,
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+    DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD,
+    REDIS_HOST, REDIS_PORT,
+    STATS_INTERVAL,
+)
+
+# Packages
+from polymarket_common import generate_slug
+from service_common import AsyncServiceBase, setup_logging
+
+logger = setup_logging(__name__)
+
+
+# =============================================================================
+# Crossing Strategy with Count Limit
+# =============================================================================
+@dataclass
+class TradeSignal:
+    side: str
+    reason: str
+    contracts: int  # 주문 수량
+    is_hedge: bool = False  # 10회차 hedge (UP/DOWN 양쪽)
+
+
+class CrossingStrategy5M:
+    """
+    15분봉 전체 Crossing 전략 (횟수 제한 + 헤지)
+    - 캔들당 최대 10회 진입
+    - 1회차: UNIT (4)
+    - 2~9회차: 2*UNIT (8)
+    - 10회차: UNIT (4) + hedge UP/DOWN x HEDGE_UNIT (5)
+    """
+
+    name = "crossing_limit_hedge"
+    description = "15분봉 전체 crossing에 GTC 진입 (UNIT/2*UNIT/UNIT+hedge, 10회 제한)"
+
+    def __init__(self):
+        self.candle_state: Dict[str, Dict[str, Any]] = {}
+
+    def _get_candle_state(self, candle_key: str) -> Dict[str, Any]:
+        if candle_key not in self.candle_state:
+            self.candle_state[candle_key] = {
+                "count": 0,
+                "last_direction": None,
+                "failed": False,
+            }
+        return self.candle_state[candle_key]
+
+    def mark_candle_failed(self, candle_key: str):
+        """주문 실패 시 호출"""
+        state = self._get_candle_state(candle_key)
+        state["failed"] = True
+
+    def should_enter_on_crossing(
+        self,
+        elapsed_seconds: int,
+        crossing_direction: str,
+        candle_key: str,
+    ) -> Optional[TradeSignal]:
+        state = self._get_candle_state(candle_key)
+
+        # 실패했으면 skip
+        if state["failed"]:
+            return None
+
+        # 횟수 제한 체크
+        if state["count"] >= CROSSING_MAX_COUNT:
+            return None
+
+        # 최소 시간 이전 무시
+        if elapsed_seconds < CROSSING_MIN_ELAPSED_SECONDS:
+            return None
+
+        # cutoff 이후 무시
+        if elapsed_seconds >= CROSSING_CUTOFF_SECONDS:
+            return None
+
+        # 횟수 증가
+        state["count"] += 1
+        state["last_direction"] = crossing_direction
+
+        side = "up" if crossing_direction == "up" else "down"
+
+        # 수량 결정: 1회차=UNIT, 2~9회차=2*UNIT, 10회차=UNIT (+ hedge 별도)
+        is_hedge = False
+        if state["count"] == 1:
+            contracts = CROSSING_BET_CONTRACT_UNIT  # 1회차: UNIT (4)
+        elif state["count"] == CROSSING_MAX_COUNT:
+            contracts = CROSSING_BET_CONTRACT_UNIT  # 10회차: UNIT (4)
+            is_hedge = True  # 10회차는 hedge 추가
+        else:
+            contracts = CROSSING_BET_CONTRACT_UNIT * 2  # 2~9회차: 2*UNIT (8)
+
+        reason = f"CROSS15M_{crossing_direction.upper()} #{state['count']} @{elapsed_seconds}s"
+
+        return TradeSignal(
+            side=side,
+            reason=reason,
+            contracts=contracts,
+            is_hedge=is_hedge,
+        )
+
+    def get_status(self) -> Dict[str, Any]:
+        active = {k: v["count"] for k, v in self.candle_state.items() if v["count"] > 0}
+        return {"active_candles": active}
+
+
+# =============================================================================
+# Real Trader Service
+# =============================================================================
+class RealTraderCross5MService(AsyncServiceBase):
+    """Real Trader: 0-5분 Crossing Strategy"""
+
+    def __init__(self):
+        super().__init__(DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD, REDIS_HOST, REDIS_PORT)
+
+        self.ob_cache: Dict[str, Dict] = {}
+
+        self.strategies: Dict[str, CrossingStrategy5M] = {}
+        for coin in COINS:
+            self.strategies[coin] = CrossingStrategy5M()
+
+        self.stats = defaultdict(int)
+        self.start_time = time.time()
+
+        self.last_ob_message_time: float = 0.0
+        self.p1_disconnect_warned: bool = False
+
+        # Telegram queue (non-blocking)
+        self.telegram_queue: asyncio.Queue = asyncio.Queue()
+
+        # CLOB client
+        self.clob_client = None
+        self._clob_initialized = False
+        self.token_info_cache: Dict[str, Dict] = {}
+
+    def _init_clob_client(self):
+        """Initialize Polymarket CLOB client"""
+        if not POLYMARKET_PRIVATE_KEY:
+            logger.warning("POLYMARKET_PRIVATE_KEY not set, live trading disabled")
+            return
+
+        if not POLYMARKET_PROXY_ADDRESS:
+            logger.warning("POLYMARKET_PROXY_ADDRESS not set, live trading disabled")
+            return
+
+        try:
+            from py_clob_client.client import ClobClient
+
+            self.clob_client = ClobClient(
+                host=POLYMARKET_HOST,
+                key=POLYMARKET_PRIVATE_KEY,
+                chain_id=POLYMARKET_CHAIN_ID,
+                signature_type=2,
+                funder=POLYMARKET_PROXY_ADDRESS,
+            )
+
+            api_creds = self.clob_client.create_or_derive_api_creds()
+            self.clob_client.set_api_creds(api_creds)
+
+            self._clob_initialized = True
+            logger.info(f"CLOB client initialized (host={POLYMARKET_HOST}, chain={POLYMARKET_CHAIN_ID})")
+
+        except ImportError:
+            logger.error("py-clob-client not installed, live trading disabled")
+        except Exception as e:
+            logger.error(f"Failed to initialize CLOB client: {e}")
+
+    @property
+    def is_live_enabled(self) -> bool:
+        return self._clob_initialized and self.clob_client is not None
+
+    def is_healthy(self) -> bool:
+        return (self.db_pool is not None and self.redis_client is not None)
+
+    # =========================================================================
+    # Telegram
+    # =========================================================================
+    async def telegram_sender(self):
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+            logger.info("Telegram not configured, sender disabled")
+            return
+
+        async with aiohttp.ClientSession() as session:
+            while True:
+                try:
+                    msg = await self.telegram_queue.get()
+                    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+                    await session.post(url, json={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "text": msg,
+                        "parse_mode": "HTML"
+                    }, timeout=aiohttp.ClientTimeout(total=10))
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"Telegram send error: {e}")
+
+    def notify(self, message: str):
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            try:
+                self.telegram_queue.put_nowait(message)
+            except asyncio.QueueFull:
+                logger.warning("Telegram queue full, dropping message")
+
+    # =========================================================================
+    # Redis Pub/Sub Subscriber
+    # =========================================================================
+    async def redis_subscriber(self):
+        while True:
+            try:
+                pubsub = self.redis_client.pubsub()
+                # TIMEFRAMES에 맞는 candle_boundary만 구독
+                boundary_channels = [f"ch:candle_boundary:{tf}" for tf in TIMEFRAMES]
+                await pubsub.psubscribe("ch:crossing:*", "ch:orderbook:*", *boundary_channels)
+                logger.info(f"[PUBSUB] Subscribed to ch:crossing:*, ch:orderbook:*, ch:candle_boundary:{TIMEFRAMES}")
+
+                async for message in pubsub.listen():
+                    if message["type"] not in ("message", "pmessage"):
+                        continue
+
+                    try:
+                        data = json.loads(message["data"])
+                        channel = message.get("channel", "")
+
+                        if "ch:candle_boundary" in channel:
+                            await self._handle_candle_boundary(data)
+                        elif "ch:crossing:" in channel:
+                            await self._handle_crossing_event(data)
+                        elif "ch:orderbook:" in channel:
+                            await self._handle_orderbook_message(data)
+
+                    except json.JSONDecodeError:
+                        pass
+                    except Exception as e:
+                        logger.error(f"[PUBSUB] message error: {e}")
+                        self.stats["pubsub_errors"] += 1
+
+            except Exception as e:
+                logger.error(f"[PUBSUB] subscriber error: {e}")
+                await asyncio.sleep(3)
+
+    async def _handle_orderbook_message(self, data: Dict):
+        coin = data.get("coin")
+        tf = data.get("timeframe")
+        side = data.get("side")
+
+        if not coin or not tf or not side:
+            return
+
+        if coin not in COINS:
+            return
+
+        cache_key = f"{coin}_{tf}_{side}"
+
+        token_id = data["token_id"]
+        self.ob_cache[cache_key] = {
+            "best_bid": data["best_bid"],
+            "best_ask": data["best_ask"],
+            "best_bid_size": data.get("best_bid_size", 0),
+            "best_ask_size": data.get("best_ask_size", 0),
+            "mid_price": data["mid_price"],
+            "market_slug": data["slug"],
+            "token_id": token_id,
+            "candle_start_ts": data.get("candle_start_ts"),
+            "candle_end_ts": data.get("candle_end_ts"),
+            "timestamp": data["timestamp"],
+        }
+
+        if token_id and token_id not in self.token_info_cache:
+            asyncio.create_task(self._prefetch_token_info(token_id))
+
+        self.stats["ob_messages"] += 1
+        self.last_ob_message_time = time.time()
+        if self.p1_disconnect_warned:
+            logger.info("[P1] Connection restored")
+            self.p1_disconnect_warned = False
+
+    async def _prefetch_token_info(self, token_id: str):
+        if not self.is_live_enabled:
+            return
+        if token_id in self.token_info_cache:
+            return
+        try:
+            tick_size = self.clob_client.get_tick_size(token_id)
+            neg_risk = self.clob_client.get_neg_risk(token_id)
+            fee_rate = self.clob_client.get_fee_rate_bps(token_id)
+            self.token_info_cache[token_id] = {
+                "tick_size": tick_size,
+                "neg_risk": neg_risk,
+                "fee_rate": fee_rate,
+            }
+            logger.info(f"[PREFETCH] Cached: {token_id[:16]}... tick={tick_size} neg_risk={neg_risk} fee={fee_rate}bps")
+        except Exception as e:
+            logger.warning(f"[PREFETCH] Failed to cache token info: {e}")
+
+    async def _handle_candle_boundary(self, data: Dict):
+        """캔들 경계 → 전략 리셋"""
+        tf = data.get("timeframe", "?")
+        logger.info(f"[CANDLE_BOUNDARY] Resetting strategies (tf={tf})")
+        self.ob_cache.clear()
+        self.token_info_cache.clear()
+        for strategy in self.strategies.values():
+            strategy.candle_state.clear()
+
+    async def _handle_crossing_event(self, data: Dict):
+        coin = data.get("coin")
+        tf = data.get("timeframe")
+        direction = data.get("direction")
+        candle_start_str = data.get("candle_start")
+        candle_end_str = data.get("candle_end")
+
+        if not all([coin, tf, direction, candle_start_str, candle_end_str]):
+            logger.warning(f"[CROSSING] Invalid data: {data}")
+            return
+
+        if coin not in COINS:
+            return
+
+        if coin not in self.strategies:
+            return
+
+        self.stats["crossing_events"] += 1
+
+        try:
+            candle_start = datetime.fromisoformat(candle_start_str.replace('Z', '+00:00'))
+            candle_end = datetime.fromisoformat(candle_end_str.replace('Z', '+00:00'))
+            now = datetime.now(timezone.utc)
+            # binance_ws에서 보낸 elapsed_ms 사용 (없으면 직접 계산)
+            elapsed_ms = data.get("elapsed_ms") or int((now - candle_start).total_seconds() * 1000)
+            elapsed_seconds = elapsed_ms // 1000
+        except Exception as e:
+            logger.error(f"[CROSSING] Time parse error: {e}")
+            return
+
+        if now >= candle_end:
+            return
+
+        side = "up" if direction == "up" else "down"
+        orderbook = self.get_orderbook(coin, tf, side)
+
+        if not orderbook:
+            logger.warning(f"[{coin}] CROSSING but no {side.upper()} orderbook cache")
+            return
+
+        expected_slug = generate_slug(coin, tf)
+        ob_slug = orderbook.get('market_slug', '')
+        if ob_slug != expected_slug:
+            logger.warning(f"[{coin}] SLUG_MISMATCH expected={expected_slug} got={ob_slug}")
+            return
+
+        token_id = orderbook.get('token_id', '')
+        if not token_id:
+            logger.error(f"[{coin}] No token_id for {side.upper()}")
+            return
+
+        candle_key = f"{coin}_{tf}_{candle_start.isoformat()}"
+
+        strategy = self.strategies[coin]
+        signal = strategy.should_enter_on_crossing(
+            elapsed_seconds=elapsed_seconds,
+            crossing_direction=direction,
+            candle_key=candle_key,
+        )
+
+        if signal:
+            crossing_info = {
+                "direction": direction,
+                "candle_open": data.get("candle_open"),
+                "prev_price": data.get("prev_price"),
+                "current_price": data.get("current_price"),
+                "elapsed_seconds": elapsed_seconds,
+                "elapsed_ms": elapsed_ms,
+                "prev_elapsed_ms": data.get("prev_elapsed_ms"),
+                "curr_elapsed_ms": data.get("curr_elapsed_ms"),
+            }
+
+            # 일반 주문 실행 (1~10회 모두)
+            asyncio.create_task(self.execute_order(
+                coin, tf, signal, token_id,
+                candle_start, candle_end,
+                crossing_info=crossing_info,
+                candle_key=candle_key,
+            ))
+
+            # 10회차면 추가로 hedge 주문 (UP+DOWN @0.45 maker)
+            # 단, 일정 시간 이상 남았을 때만 (maker 주문 체결 시간 확보)
+            if signal.is_hedge:
+                remaining_seconds = CROSSING_CUTOFF_SECONDS - elapsed_seconds
+                if remaining_seconds >= CROSSING_HEDGE_MIN_REMAINING_SECONDS:
+                    asyncio.create_task(self.execute_hedge_orders(
+                        coin, tf, signal, candle_start, candle_end,
+                        crossing_info=crossing_info,
+                        candle_key=candle_key,
+                    ))
+                else:
+                    logger.info(f"[{coin}] HEDGE skipped: only {remaining_seconds}s remaining (need {CROSSING_HEDGE_MIN_REMAINING_SECONDS}s+)")
+
+    def get_orderbook(self, coin: str, timeframe: str, side: str = "up") -> Optional[Dict]:
+        key = f"{coin}_{timeframe}_{side}"
+        cached = self.ob_cache.get(key)
+        if not cached:
+            return None
+        if time.time() - cached.get("timestamp", 0) > 60:
+            return None
+        return cached
+
+    # =========================================================================
+    # Real Order Execution
+    # =========================================================================
+    async def execute_hedge_orders(
+        self,
+        coin: str,
+        timeframe: str,
+        signal: TradeSignal,
+        candle_start: datetime,
+        candle_end: datetime,
+        crossing_info: Optional[Dict] = None,
+        candle_key: Optional[str] = None,
+    ):
+        """10회차 hedge: UP/DOWN 양쪽에 GTC 주문"""
+        contracts = CROSSING_HEDGE_UNIT  # hedge는 HEDGE_UNIT (5) 사용
+        reason = signal.reason
+
+        logger.info(f"[{coin}] HEDGE ORDER: placing GTC @{GTC_HEDGE_PRICE:.2f} on BOTH UP/DOWN x{contracts}")
+
+        # UP side orderbook
+        up_orderbook = self.get_orderbook(coin, timeframe, "up")
+        # DOWN side orderbook
+        down_orderbook = self.get_orderbook(coin, timeframe, "down")
+
+        if not up_orderbook or not down_orderbook:
+            logger.error(f"[{coin}] HEDGE: missing orderbook (up={bool(up_orderbook)}, down={bool(down_orderbook)})")
+            self.notify(f"❌ <b>HEDGE FAILED</b>\nMissing orderbook")
+            return
+
+        up_token_id = up_orderbook.get('token_id', '')
+        down_token_id = down_orderbook.get('token_id', '')
+
+        if not up_token_id or not down_token_id:
+            logger.error(f"[{coin}] HEDGE: missing token_id")
+            self.notify(f"❌ <b>HEDGE FAILED</b>\nMissing token_id")
+            return
+
+        # Place both orders
+        up_result = await self._place_gtc_order(
+            coin=coin,
+            token_id=up_token_id,
+            target_contracts=contracts,
+            gtc_price=GTC_HEDGE_PRICE,
+        )
+
+        down_result = await self._place_gtc_order(
+            coin=coin,
+            token_id=down_token_id,
+            target_contracts=contracts,
+            gtc_price=GTC_HEDGE_PRICE,
+        )
+
+        # Log results
+        up_filled = up_result.get("filled_contracts", 0)
+        down_filled = down_result.get("filled_contracts", 0)
+        up_price = up_result.get("fill_price", 0)
+        down_price = down_result.get("fill_price", 0)
+
+        logger.info(
+            f"[{coin}] HEDGE RESULT: UP filled={up_filled} @{up_price:.3f} | "
+            f"DOWN filled={down_filled} @{down_price:.3f}"
+        )
+
+        # Record trades
+        elapsed_seconds = crossing_info.get('elapsed_seconds', 0) if crossing_info else 0
+
+        # UP trade
+        up_signal = TradeSignal(side="up", reason=f"HEDGE_UP #{CROSSING_MAX_COUNT} @{elapsed_seconds}s", contracts=contracts, is_hedge=True)
+        await self._record_trade(
+            coin, timeframe, up_signal, up_result,
+            candle_start, candle_end, crossing_info,
+            up_result.get("total_latency_ms", 0)
+        )
+
+        # DOWN trade
+        down_signal = TradeSignal(side="down", reason=f"HEDGE_DOWN #{CROSSING_MAX_COUNT} @{elapsed_seconds}s", contracts=contracts, is_hedge=True)
+        await self._record_trade(
+            coin, timeframe, down_signal, down_result,
+            candle_start, candle_end, crossing_info,
+            down_result.get("total_latency_ms", 0)
+        )
+
+        # Telegram notification
+        candle_open = (crossing_info.get('candle_open') or 0) if crossing_info else 0
+
+        up_status = "✓" if up_result.get("success") else "✗"
+        down_status = "✓" if down_result.get("success") else "✗"
+
+        # elapsed_seconds를 m:ss 포맷으로
+        elapsed_min = elapsed_seconds // 60
+        elapsed_sec = elapsed_seconds % 60
+
+        self.notify(
+            f"#{CROSSING_MAX_COUNT} HEDGE | open {candle_open:,.2f}\n"
+            f"@{elapsed_min}:{elapsed_sec:02d}\n"
+            f"UP x{contracts} @{GTC_HEDGE_PRICE:.2f} → {up_filled:.0f} {up_status}\n"
+            f"DOWN x{contracts} @{GTC_HEDGE_PRICE:.2f} → {down_filled:.0f} {down_status}"
+        )
+
+    async def execute_order(
+        self,
+        coin: str,
+        timeframe: str,
+        signal: TradeSignal,
+        token_id: str,
+        candle_start: datetime,
+        candle_end: datetime,
+        crossing_info: Optional[Dict] = None,
+        candle_key: Optional[str] = None,
+    ):
+        side = signal.side.upper()
+        contracts = signal.contracts
+        reason = signal.reason
+
+        elapsed_seconds = crossing_info.get('elapsed_seconds', 150) if crossing_info else 150
+        gtc_price = get_gtc_price(elapsed_seconds)
+
+        await asyncio.sleep(0.005)
+        orderbook = self.get_orderbook(coin, timeframe, signal.side)
+        best_ask_pre = orderbook.get('best_ask', 0) if orderbook else 0
+        best_bid_pre = orderbook.get('best_bid', 0) if orderbook else 0
+        logger.info(f"[{coin}] PRE-ORDER: {side} x{contracts} | best_ask={best_ask_pre:.3f} GTC={gtc_price:.2f} @{elapsed_seconds}s")
+
+        order_result = None
+
+        if not self.is_live_enabled:
+            logger.warning(f"[{coin}] CLOB not enabled, skipping real order")
+            order_result = {
+                "success": False,
+                "error": "CLOB not enabled",
+                "target_contracts": contracts,
+                "filled_contracts": 0,
+                "filled_cost": 0.0,
+                "fill_price": 0.0,
+                "total_latency_ms": 0,
+            }
+        else:
+            order_result = await self._place_gtc_order(
+                coin=coin,
+                token_id=token_id,
+                target_contracts=contracts,
+                gtc_price=gtc_price,
+            )
+
+        latency_ms = order_result.get("total_latency_ms", 0)
+        filled = order_result.get("filled_contracts", 0)
+        fill_price = order_result.get("fill_price", 0.0)
+
+        await asyncio.sleep(0.005)
+        orderbook_post = self.get_orderbook(coin, timeframe, signal.side)
+        best_ask_post = orderbook_post.get('best_ask', 0) if orderbook_post else 0
+        best_bid_post = orderbook_post.get('best_bid', 0) if orderbook_post else 0
+        logger.info(f"[{coin}] POST-ORDER: best_ask {best_ask_pre:.3f}→{best_ask_post:.3f} | best_bid {best_bid_pre:.3f}→{best_bid_post:.3f}")
+
+        await self._record_trade(
+            coin, timeframe, signal, order_result,
+            candle_start, candle_end,
+            crossing_info, latency_ms
+        )
+
+        cross_dir = crossing_info.get('direction', '?').upper() if crossing_info else '?'
+        candle_open = (crossing_info.get('candle_open') or 0) if crossing_info else 0
+        prev_price = (crossing_info.get('prev_price') or 0) if crossing_info else 0
+        curr_price = (crossing_info.get('current_price') or 0) if crossing_info else 0
+        prev_elapsed_ms = crossing_info.get('prev_elapsed_ms') if crossing_info else None
+        curr_elapsed_ms = crossing_info.get('curr_elapsed_ms') if crossing_info else None
+
+        # ms를 m:ss.mmm 포맷으로 변환
+        def fmt_ms(ms):
+            if ms is None:
+                return "?"
+            s = ms // 1000
+            return f"{s//60}:{s%60:02d}.{ms%1000:03d}"
+
+        prev_time_str = fmt_ms(prev_elapsed_ms)
+        curr_time_str = fmt_ms(curr_elapsed_ms)
+
+        target = order_result.get("target_contracts", contracts)
+
+        # reason에서 entry number 추출 (예: "CROSS14M_UP #3 @120s")
+        entry_num = None
+        if "#" in reason:
+            try:
+                entry_num = int(reason.split("#")[1].split()[0])
+            except:
+                pass
+
+        if order_result.get("success"):
+            self.stats["orders_filled"] += 1
+
+            logger.info(
+                f"[{coin}] GTC ORDER: {side} x{contracts} | "
+                f"filled={filled} @{fill_price:.3f} | latency={latency_ms:.0f}ms"
+            )
+
+            status_mark = "✓" if filled >= target else "⚠️"
+            entry_label = f"#{entry_num}" if entry_num else ""
+
+            self.notify(
+                f"{entry_label} {cross_dir} | open {candle_open:,.2f}\n"
+                f"{prev_time_str} → {curr_time_str}\n"
+                f"{prev_price:,.2f} → {curr_price:,.2f}\n"
+                f"x{contracts} @{fill_price:.2f} {filled:.0f}/{target} {status_mark}"
+            )
+        else:
+            self.stats["orders_failed"] += 1
+            error = order_result.get("error", "Unknown")
+
+            logger.error(f"[{coin}] GTC ORDER FAILED: {side} x{contracts} | error={error}")
+
+            if candle_key and coin in self.strategies:
+                self.strategies[coin].mark_candle_failed(candle_key)
+
+            entry_label = f"#{entry_num}" if entry_num else ""
+            self.notify(
+                f"{entry_label} {cross_dir} | open {candle_open:,.2f}\n"
+                f"{prev_time_str} → {curr_time_str}\n"
+                f"{prev_price:,.2f} → {curr_price:,.2f}\n"
+                f"x{contracts} FAILED: {error}"
+            )
+
+    async def _place_gtc_order(
+        self,
+        coin: str,
+        token_id: str,
+        target_contracts: int,
+        gtc_price: float,
+    ) -> Dict[str, Any]:
+        from py_clob_client.clob_types import OrderArgs, OrderType
+        from py_clob_client.order_builder.constants import BUY
+
+        start_time = time.time()
+        order_price = gtc_price
+
+        try:
+            cached = self.token_info_cache.get(token_id)
+            if cached:
+                from py_clob_client.clob_types import PartialCreateOrderOptions
+                order_args = OrderArgs(
+                    token_id=token_id,
+                    price=order_price,
+                    size=float(target_contracts),
+                    side=BUY,
+                    fee_rate_bps=cached["fee_rate"],
+                )
+                options = PartialCreateOrderOptions(
+                    tick_size=cached["tick_size"],
+                    neg_risk=cached["neg_risk"],
+                )
+                signed_order = self.clob_client.create_order(order_args, options)
+            else:
+                order_args = OrderArgs(
+                    token_id=token_id,
+                    price=order_price,
+                    size=float(target_contracts),
+                    side=BUY,
+                )
+                signed_order = self.clob_client.create_order(order_args)
+
+            response = self.clob_client.post_order(signed_order, OrderType.GTC)
+            logger.info(f"[GTC] CLOB response (price={order_price}, size={target_contracts}): {response}")
+
+            if isinstance(response, dict):
+                order_id = response.get("orderID") or response.get("orderId", "")
+
+                if response.get("success", True) and order_id:
+                    filled = 0
+                    cost = 0.0
+                    try:
+                        making_amt = response.get("makingAmount", "0")
+                        taking_amt = response.get("takingAmount", "0")
+                        filled = float(taking_amt) if taking_amt else 0.0
+                        cost = float(making_amt) if making_amt else 0.0
+                    except (ValueError, TypeError):
+                        pass
+
+                    fill_price = cost / filled if filled > 0 else order_price
+
+                    total_latency = (time.time() - start_time) * 1000
+
+                    return {
+                        "success": True,  # order_id 받으면 성공 (maker 대기 포함)
+                        "status": "FILLED" if filled > 0 else "PENDING",
+                        "target_contracts": target_contracts,
+                        "filled_contracts": filled,
+                        "filled_cost": cost,
+                        "fill_price": fill_price,
+                        "order_id": order_id,
+                        "order_price": order_price,
+                        "total_latency_ms": total_latency,
+                        "error": None,
+                    }
+                else:
+                    error_msg = (
+                        response.get("errorMsg")
+                        or response.get("error")
+                        or response.get("message", str(response))
+                    )
+                    total_latency = (time.time() - start_time) * 1000
+
+                    return {
+                        "success": False,
+                        "target_contracts": target_contracts,
+                        "filled_contracts": 0,
+                        "filled_cost": 0.0,
+                        "fill_price": 0.0,
+                        "order_price": order_price,
+                        "total_latency_ms": total_latency,
+                        "error": error_msg,
+                    }
+            else:
+                total_latency = (time.time() - start_time) * 1000
+                return {
+                    "success": False,
+                    "target_contracts": target_contracts,
+                    "filled_contracts": 0,
+                    "filled_cost": 0.0,
+                    "fill_price": 0.0,
+                    "order_price": order_price,
+                    "total_latency_ms": total_latency,
+                    "error": f"Unexpected response type: {type(response)}",
+                }
+
+        except Exception as e:
+            error_msg = str(e)
+            total_latency = (time.time() - start_time) * 1000
+            logger.error(f"[GTC] Exception: {error_msg}")
+
+            return {
+                "success": False,
+                "target_contracts": target_contracts,
+                "filled_contracts": 0,
+                "filled_cost": 0.0,
+                "fill_price": 0.0,
+                "order_price": order_price,
+                "total_latency_ms": total_latency,
+                "error": error_msg,
+            }
+
+    async def _record_trade(
+        self,
+        coin: str,
+        timeframe: str,
+        signal: TradeSignal,
+        order_result: Dict[str, Any],
+        candle_start: datetime,
+        candle_end: datetime,
+        crossing_info: Optional[Dict],
+        latency_ms: float,
+    ):
+        try:
+            side = signal.side.upper()
+            order_price = order_result.get('order_price', 0.70)
+            target_contracts = order_result.get('target_contracts', signal.contracts)
+            reason = signal.reason
+
+            filled_contracts = round(order_result.get('filled_contracts', 0))
+            filled_cost = order_result.get('filled_cost', 0.0)
+            fill_price = order_result.get('fill_price', 0.0)
+
+            snapshot_data = {
+                'crossing': crossing_info,
+                'order_result': order_result,
+                'latency_ms': latency_ms,
+            }
+
+            # order_result에서 status 사용 (FILLED/PENDING/FAILED)
+            order_id = order_result.get('order_id', '')
+            if order_result.get('success'):
+                status = order_result.get('status', 'FILLED')  # FILLED or PENDING
+            else:
+                status = 'FAILED'
+
+            async with self.db_pool.acquire() as conn:
+                trade_id = await conn.fetchval("""
+                    INSERT INTO test_paper_trades (
+                        time, strategy_name, coin, timeframe,
+                        mid_price, up_mid_price, down_mid_price,
+                        side, order_price, reason, orderbook_snapshot,
+                        market_slug, token_id, order_id, candle_start_time, candle_end_time,
+                        contracts, cost, filled_contracts, filled_cost, status
+                    ) VALUES (
+                        NOW(), $1, $2, $3,
+                        $4, $5, $6,
+                        $7, $8, $9, $10,
+                        $11, $12, $13, $14, $15,
+                        $16, $17, $18, $19, $20
+                    )
+                    RETURNING id
+                """,
+                    STRATEGY_NAME, coin, timeframe,
+                    0.5, None, None,
+                    side, order_price, reason, json.dumps(snapshot_data),
+                    f'{coin}-{timeframe}', '', order_id, candle_start, candle_end,
+                    target_contracts, target_contracts * order_price,
+                    filled_contracts, filled_cost,
+                    status,
+                )
+
+                if order_result.get('success') and filled_contracts > 0:
+                    await conn.execute("""
+                        UPDATE test_paper_trades
+                        SET fill_time = NOW(), fill_price = $1
+                        WHERE id = $2
+                    """, fill_price, trade_id)
+
+                logger.info(f"[{coin}] Trade recorded: id={trade_id} status={status} target={target_contracts} filled={filled_contracts}")
+
+            self.stats["trades_created"] += 1
+
+        except Exception as e:
+            logger.error(f"[{coin}] _record_trade error: {e}")
+
+    # =========================================================================
+    # Settlement
+    # =========================================================================
+    async def settle_trades(self, coin: str, timeframe: str,
+                            candle_start: datetime, candle_end: datetime) -> int:
+        market_result = await self.get_price_result(coin, timeframe, candle_start, candle_end)
+        if not market_result:
+            return 0
+
+        settled_count = 0
+        try:
+            async with self.db_pool.acquire() as conn:
+                trades = await conn.fetch("""
+                    SELECT id, side, fill_price, contracts, cost,
+                           filled_contracts, filled_cost, status, orderbook_snapshot
+                    FROM test_paper_trades
+                    WHERE coin = $1 AND timeframe = $2 AND strategy_name = $3
+                      AND status IN ('FILLED', 'FAILED')
+                      AND candle_start_time = $4
+                    ORDER BY time ASC
+                """, coin, timeframe, STRATEGY_NAME, candle_start)
+
+                if not trades:
+                    return 0
+
+                total_pnl = 0.0
+                results = []
+
+                for trade in trades:
+                    trade_id = trade['id']
+                    side = trade['side']
+                    status = trade['status']
+                    fill_price = float(trade['fill_price']) if trade['fill_price'] is not None else 0.0
+                    filled_contracts = float(trade['filled_contracts']) if trade['filled_contracts'] is not None else 0.0
+                    filled_cost = float(trade['filled_cost']) if trade['filled_cost'] is not None else 0.0
+                    if filled_contracts == 0 and trade['contracts']:
+                        filled_contracts = float(trade['contracts'])
+                        filled_cost = float(trade['cost']) if trade['cost'] else 0.0
+
+                    snapshot = {}
+                    if trade['orderbook_snapshot']:
+                        try:
+                            snapshot = json.loads(trade['orderbook_snapshot']) if isinstance(trade['orderbook_snapshot'], str) else trade['orderbook_snapshot']
+                        except:
+                            pass
+
+                    crossing = snapshot.get('crossing', {})
+
+                    if status == 'FAILED':
+                        results.append({
+                            "side": side,
+                            "status": "FAILED",
+                            "price": 0,
+                            "pnl": 0,
+                            "outcome": "FAILED",
+                            "crossing": crossing,
+                        })
+                        continue
+
+                    if market_result == 'FLAT':
+                        exit_price = fill_price
+                        pnl = 0.0
+                        outcome = 'FLAT'
+                    elif side == market_result:
+                        exit_price = 1.0
+                        pnl = filled_contracts * exit_price - filled_cost
+                        outcome = 'WIN'
+                    else:
+                        exit_price = 0.0
+                        pnl = -filled_cost
+                        outcome = 'LOSS'
+
+                    await conn.execute("""
+                        UPDATE test_paper_trades
+                        SET status = 'CLOSED', closed_at = NOW(),
+                            exit_price = $1, pnl = $2, outcome = $3, market_result = $4
+                        WHERE id = $5
+                    """, exit_price, pnl, outcome, market_result, trade_id)
+
+                    logger.info(f"[{coin}] SETTLED: {side} -> {outcome} ({market_result}) | PnL: ${pnl:.4f}")
+                    self.stats["trades_settled"] += 1
+                    settled_count += 1
+                    total_pnl += pnl
+
+                    results.append({
+                        "side": side,
+                        "status": "FILLED",
+                        "price": fill_price,
+                        "pnl": pnl,
+                        "outcome": outcome,
+                        "crossing": crossing,
+                    })
+
+                if results:
+                    filled = [r for r in results if r['status'] == 'FILLED']
+                    failed = [r for r in results if r['status'] == 'FAILED']
+                    wins = len([r for r in filled if r['outcome'] == 'WIN'])
+                    losses = len([r for r in filled if r['outcome'] == 'LOSS'])
+                    candle_time_str = candle_start.strftime('%H:%M')
+
+                    lines = [
+                        f"<b>[{candle_time_str}] SETTLED: {market_result}</b>",
+                        f"Filled: {len(filled)} | Failed: {len(failed)} | W:{wins} L:{losses}",
+                        f"<b>PnL: ${total_pnl:+.2f}</b>",
+                    ]
+
+                    self.notify("\n".join(lines))
+
+            return settled_count
+        except Exception as e:
+            logger.error(f"[{coin}] settle_trades error: {e}")
+            return 0
+
+    async def get_price_result(self, coin: str, timeframe: str,
+                               candle_start: datetime, candle_end: datetime) -> Optional[str]:
+        ALLOWED_COLUMNS = {'binance_price', 'chainlink_price'}
+        price_column = 'binance_price' if timeframe == '1h' else 'chainlink_price'
+        if price_column not in ALLOWED_COLUMNS:
+            return None
+
+        try:
+            async with self.db_pool.acquire() as conn:
+                cnt = await conn.fetchval(f"""
+                    SELECT COUNT(*) FROM coin_prices
+                    WHERE coin = $1 AND time > $2 AND {price_column} IS NOT NULL
+                """, coin, candle_end + timedelta(seconds=5))
+
+                if not cnt or cnt == 0:
+                    return None
+
+                start_row = await conn.fetchrow(f"""
+                    SELECT {price_column} as price FROM coin_prices
+                    WHERE coin = $1 AND time >= $2 AND {price_column} IS NOT NULL
+                    ORDER BY time ASC LIMIT 1
+                """, coin, candle_start)
+
+                end_row = await conn.fetchrow(f"""
+                    SELECT {price_column} as price FROM coin_prices
+                    WHERE coin = $1 AND time >= $2 AND {price_column} IS NOT NULL
+                    ORDER BY time ASC LIMIT 1
+                """, coin, candle_end)
+
+                if not start_row or not end_row:
+                    return None
+
+                start_price = float(start_row['price'])
+                end_price = float(end_row['price'])
+
+                if end_price > start_price:
+                    result = 'UP'
+                elif end_price < start_price:
+                    result = 'DOWN'
+                else:
+                    result = 'FLAT'
+
+                logger.info(f"[{coin}] Price result: {start_price:.2f} -> {end_price:.2f} = {result}")
+                return result
+
+        except Exception as e:
+            logger.error(f"[{coin}] get_price_result error: {e}")
+            return None
+
+    async def settlement_loop(self):
+        POLL_INTERVAL = 60
+
+        try:
+            logger.info("[SETTLEMENT] Startup: settling pending trades...")
+            await self._settle_pending_trades()
+        except Exception as e:
+            logger.error(f"[SETTLEMENT] Startup settle error: {e}")
+
+        while True:
+            try:
+                await asyncio.sleep(POLL_INTERVAL)
+                await self._settle_pending_trades()
+            except Exception as e:
+                logger.error(f"Settlement loop error: {e}")
+                await asyncio.sleep(POLL_INTERVAL)
+
+    async def _settle_pending_trades(self):
+        try:
+            # 1. 먼저 PENDING 주문들 체결 여부 확인 (maker 주문)
+            await self._check_pending_orders()
+
+            # 2. 정산 대상 캔들 조회 (FILLED만)
+            async with self.db_pool.acquire() as conn:
+                pending = await conn.fetch("""
+                    SELECT DISTINCT coin, timeframe, candle_start_time, candle_end_time
+                    FROM test_paper_trades
+                    WHERE strategy_name = $1
+                      AND status = 'FILLED'
+                      AND candle_end_time < NOW() - INTERVAL '20 seconds'
+                    ORDER BY candle_start_time ASC
+                """, STRATEGY_NAME)
+
+                if pending:
+                    logger.info(f"[SETTLEMENT] Found {len(pending)} pending candles")
+
+            for row in pending:
+                settled = await self.settle_trades(row['coin'], row['timeframe'],
+                                                   row['candle_start_time'], row['candle_end_time'])
+                if settled > 0:
+                    logger.info(f"[SETTLEMENT] {row['coin']}/{row['timeframe']}: settled {settled} trades")
+
+        except Exception as e:
+            logger.error(f"[SETTLEMENT] _settle_pending_trades error: {e}")
+
+    async def _check_pending_orders(self):
+        """PENDING 상태의 maker 주문들 체결 여부 확인"""
+        if not self.is_live_enabled:
+            return
+
+        try:
+            async with self.db_pool.acquire() as conn:
+                pending_orders = await conn.fetch("""
+                    SELECT id, order_id, coin, side, contracts, order_price
+                    FROM test_paper_trades
+                    WHERE strategy_name = $1
+                      AND status = 'PENDING'
+                      AND order_id IS NOT NULL
+                      AND candle_end_time < NOW() - INTERVAL '10 seconds'
+                """, STRATEGY_NAME)
+
+                if not pending_orders:
+                    return
+
+                logger.info(f"[PENDING] Checking {len(pending_orders)} pending orders...")
+
+                for order in pending_orders:
+                    trade_id = order['id']
+                    order_id = order['order_id']
+                    coin = order['coin']
+                    side = order['side']
+
+                    try:
+                        # CLOB API로 주문 상태 조회
+                        result = self.clob_client.get_order(order_id)
+
+                        if result:
+                            # 체결량 확인
+                            size_matched = float(result.get('size_matched', 0) or 0)
+
+                            if size_matched > 0:
+                                # 체결됨 → FILLED로 업데이트
+                                fill_price = order['order_price']  # maker 주문이므로 order_price가 fill_price
+                                filled_qty = round(size_matched)
+                                await conn.execute("""
+                                    UPDATE test_paper_trades
+                                    SET status = 'FILLED',
+                                        filled_contracts = $1,
+                                        filled_cost = $2,
+                                        fill_price = $3,
+                                        fill_time = NOW()
+                                    WHERE id = $4
+                                """, filled_qty, size_matched * float(fill_price), float(fill_price), trade_id)
+                                logger.info(f"[PENDING] {coin} {side} order {order_id[:16]}... FILLED: {size_matched}")
+                            else:
+                                # 미체결 → EXPIRED로 업데이트
+                                await conn.execute("""
+                                    UPDATE test_paper_trades
+                                    SET status = 'EXPIRED'
+                                    WHERE id = $1
+                                """, trade_id)
+                                logger.info(f"[PENDING] {coin} {side} order {order_id[:16]}... EXPIRED (no fill)")
+                        else:
+                            # 주문 조회 실패 → EXPIRED
+                            await conn.execute("""
+                                UPDATE test_paper_trades
+                                SET status = 'EXPIRED'
+                                WHERE id = $1
+                            """, trade_id)
+                            logger.warning(f"[PENDING] {coin} {side} order {order_id[:16]}... not found, marking EXPIRED")
+
+                    except Exception as e:
+                        logger.error(f"[PENDING] Error checking order {order_id[:16]}...: {e}")
+
+        except Exception as e:
+            logger.error(f"[PENDING] _check_pending_orders error: {e}")
+
+    # =========================================================================
+    # Stats & Watchdog
+    # =========================================================================
+    async def stats_loop(self):
+        while True:
+            await asyncio.sleep(STATS_INTERVAL)
+            uptime = int(time.time() - self.start_time)
+            strategy_status = {c: s.get_status() for c, s in self.strategies.items()}
+            logger.info(
+                f"[STATS] uptime={uptime}s | strategy={STRATEGY_NAME} | "
+                f"live={self.is_live_enabled} | "
+                f"ob_msgs={self.stats.get('ob_messages', 0)} | "
+                f"crossing={self.stats.get('crossing_events', 0)} | "
+                f"filled={self.stats.get('orders_filled', 0)} | "
+                f"failed={self.stats.get('orders_failed', 0)} | "
+                f"trades={self.stats['trades_created']}/{self.stats['trades_settled']} | "
+                f"status={strategy_status}"
+            )
+
+    async def p1_watchdog(self):
+        P1_TIMEOUT = 30
+        while True:
+            await asyncio.sleep(10)
+            if self.last_ob_message_time == 0:
+                continue
+            elapsed = time.time() - self.last_ob_message_time
+            if elapsed > P1_TIMEOUT and not self.p1_disconnect_warned:
+                logger.warning(f"[P1] No orderbook messages for {elapsed:.0f}s — P1 may be down")
+                self.notify(f"<b>[WARNING]</b> No orderbook messages for {elapsed:.0f}s")
+                self.p1_disconnect_warned = True
+
+    # =========================================================================
+    # Main
+    # =========================================================================
+    async def run(self):
+        logger.info("=" * 60)
+        logger.info("Real Trader Cross Limit Hedge: 15분봉 전체 Crossing 전략")
+        logger.info("=" * 60)
+        logger.info(f"Strategy: {STRATEGY_NAME}")
+        logger.info(f"  1st: x{CROSSING_BET_CONTRACT_UNIT}, 2-9th: x{CROSSING_BET_CONTRACT_UNIT*2}, 10th: x{CROSSING_BET_CONTRACT_UNIT} + hedge x{CROSSING_HEDGE_UNIT}")
+        logger.info(f"  Max count: {CROSSING_MAX_COUNT}")
+        logger.info(f"  GTC price: fixed 0.70 (taker-like)")
+        logger.info(f"  Entry: {CROSSING_MIN_ELAPSED_SECONDS}s ~ {CROSSING_CUTOFF_SECONDS}s (15분 전체)")
+        logger.info(f"Coins: {COINS} | Timeframes: {TIMEFRAMES}")
+        logger.info(f"Telegram: {'enabled' if TELEGRAM_BOT_TOKEN else 'disabled'}")
+        logger.info("=" * 60)
+
+        self._init_clob_client()
+        if self.is_live_enabled:
+            logger.info("LIVE TRADING ENABLED")
+            self.notify(
+                f"<b>[STARTUP]</b> {STRATEGY_NAME}\n"
+                f"Entry: 0m~15m (max {CROSSING_MAX_COUNT}x)\n"
+                f"1st: x{CROSSING_BET_CONTRACT_UNIT}, 2-9th: x{CROSSING_BET_CONTRACT_UNIT*2} @0.70\n"
+                f"10th: x{CROSSING_BET_CONTRACT_UNIT} + hedge x{CROSSING_HEDGE_UNIT} @{GTC_HEDGE_PRICE:.2f}\n"
+                f"Live: ENABLED"
+            )
+        else:
+            logger.warning("LIVE TRADING DISABLED (no credentials)")
+            self.notify(f"<b>[STARTUP]</b> {STRATEGY_NAME}\nLive: DISABLED")
+
+        if not await self.connect_db():
+            logger.error("Failed to connect to DB")
+            return
+
+        if not await self.connect_redis():
+            logger.error("Failed to connect to Redis")
+            return
+
+        self.setup_signal_handlers()
+
+        asyncio.create_task(self.telegram_sender())
+
+        await asyncio.gather(
+            self.redis_subscriber(),
+            self.settlement_loop(),
+            self.stats_loop(),
+            self.p1_watchdog(),
+            self._health_file_loop(),
+        )
+
+
+def main():
+    service = RealTraderCross5MService()
+    asyncio.run(service.run())
+
+
+if __name__ == "__main__":
+    main()

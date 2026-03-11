@@ -1,0 +1,61 @@
+"""
+P4: Paper Trader Service - 설정
+"""
+import os
+
+# === 공유 전략 설정 import ===
+from strategy_config import (
+    STRATEGY_NAME,
+    COINS,
+    TIMEFRAMES,
+    V12_5_MIN_ENTRY_PRICE,
+    V12_5_MIN_ENTRY_PRICE_LATE,
+    V12_5_EARLY_CUTOFF_MINUTES,
+    V12_5_COOLDOWN_SECONDS,
+    V12_5_MAX_SPREAD,
+    V12_5_THRESHOLDS_EARLY,
+    V12_5_THRESHOLDS_LATE,
+    V12_6_MIN_ENTRY_PRICE,
+    V12_6_MIN_ENTRY_PRICE_LATE,
+    V12_6_EARLY_CUTOFF_MINUTES,
+    V12_6_COOLDOWN_SECONDS,
+    V12_6_MAX_SPREAD,
+    V12_6_REQUIRE_MOMENTUM_MATCH,
+    V12_6_THRESHOLDS_EARLY,
+    V12_6_THRESHOLDS_LATE,
+    BET_AMOUNT,
+    MIN_LIQUIDITY,
+)
+
+# === DB 설정 ===
+DB_HOST = os.getenv("DB_HOST", "paper_trade_db")
+DB_PORT = int(os.getenv("DB_PORT", 5432))
+DB_NAME = os.getenv("DB_NAME", "paper_trade")
+DB_USER = os.getenv("DB_USER", "paper")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "papertrade")
+
+# === Redis 설정 ===
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+
+# === 수집 간격 ===
+STATS_INTERVAL = 60
+
+# === Orderbook cache TTL (seconds) ===
+OB_CACHE_TTL = 30
+
+# Re-export for convenience
+__all__ = [
+    'STRATEGY_NAME', 'COINS', 'TIMEFRAMES',
+    'V12_5_MIN_ENTRY_PRICE', 'V12_5_MIN_ENTRY_PRICE_LATE',
+    'V12_5_EARLY_CUTOFF_MINUTES', 'V12_5_COOLDOWN_SECONDS', 'V12_5_MAX_SPREAD',
+    'V12_5_THRESHOLDS_EARLY', 'V12_5_THRESHOLDS_LATE',
+    'V12_6_MIN_ENTRY_PRICE', 'V12_6_MIN_ENTRY_PRICE_LATE',
+    'V12_6_EARLY_CUTOFF_MINUTES', 'V12_6_COOLDOWN_SECONDS', 'V12_6_MAX_SPREAD',
+    'V12_6_REQUIRE_MOMENTUM_MATCH',
+    'V12_6_THRESHOLDS_EARLY', 'V12_6_THRESHOLDS_LATE',
+    'BET_AMOUNT', 'MIN_LIQUIDITY',
+    'DB_HOST', 'DB_PORT', 'DB_NAME', 'DB_USER', 'DB_PASSWORD',
+    'REDIS_HOST', 'REDIS_PORT',
+    'STATS_INTERVAL', 'OB_CACHE_TTL',
+]
