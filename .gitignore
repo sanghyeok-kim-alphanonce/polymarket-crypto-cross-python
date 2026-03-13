@@ -35,6 +35,9 @@ logs/
 # Results (keep structure, ignore actual results)
 backtest/results/*.json
 
+# Data exports
+exports/
+
 # Environment
 .env.local
 .env.*.local
