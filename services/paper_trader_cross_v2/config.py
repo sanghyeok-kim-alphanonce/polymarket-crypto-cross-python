@@ -8,7 +8,7 @@ import os
 STRATEGY_NAME = "crossing_v2"
 
 # 코인/타임프레임 (15분봉만)
-COINS = ["btc", "eth", "sol", "xrp"]
+COINS = ["btc"]
 TIMEFRAMES = ["15m"]
 
 # === Crossing V2 전략 파라미터 ===
