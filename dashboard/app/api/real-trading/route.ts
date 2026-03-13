@@ -9,6 +9,8 @@ const STRATEGY_DISPLAY_NAMES: Record<string, string> = {
   'real_crossing_5m': 'BTC 5m Crossing',
   'real_crossing_v2': '13m30s~14m30s 첫 Crossing',
   'real_trade_cross_14m_10limit': '0~14m 10회+밸런싱',
+  'real_trade_cross_limit_hedge': '15m 5분~14분 10회',
+  'real_trade_5m_cross_front': '5m 0~3분 Front',
 };
 
 export async function GET(request: Request) {

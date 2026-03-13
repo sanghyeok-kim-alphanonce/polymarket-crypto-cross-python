@@ -4,7 +4,7 @@ import { isValidCoin, invalidCoinResponse } from '@/lib/validation';
 
 export const dynamic = 'force-dynamic';
 
-const VALID_STRATEGIES = ['v12_5', 'v12_6', 'crossing', 'crossing_v2'];
+const VALID_STRATEGIES = ['v12_5', 'v12_6', 'crossing', 'crossing_v2', 'paper_cross_limit_5m', 'paper_cross_limit_15m'];
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);

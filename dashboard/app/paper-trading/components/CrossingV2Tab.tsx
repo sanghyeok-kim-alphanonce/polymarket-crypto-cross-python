@@ -70,7 +70,7 @@ interface CrossingData {
   candleStats: CandleStat[];
 }
 
-const COINS = ['btc', 'eth', 'sol', 'xrp'] as const;
+const COINS = ['btc'] as const;
 
 export default function CrossingV2Tab() {
   const [data, setData] = useState<CrossingData | null>(null);

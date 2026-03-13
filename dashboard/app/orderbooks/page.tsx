@@ -7,7 +7,7 @@ import { OrderbookRedisDisplay } from '@/components/OrderbookRedisDisplay';
 import { OrderbookView } from '@/components/OrderbookView';
 import { BookOpen } from 'lucide-react';
 
-const COINS = ['btc', 'eth', 'sol', 'xrp'] as const;
+const COINS = ['btc'] as const;
 const TIMEFRAMES = ['5m', '15m', '1h'] as const;
 
 interface BookRow {

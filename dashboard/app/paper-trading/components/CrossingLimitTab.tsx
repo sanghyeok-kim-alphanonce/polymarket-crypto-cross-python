@@ -3,7 +3,15 @@
 import { useEffect, useState, useCallback, useMemo } from 'react';
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine } from 'recharts';
 
-interface HftTrade {
+interface CrossingInfo {
+  direction: string;
+  candle_open: number;
+  prev_price: number;
+  current_price: number;
+  elapsed_seconds: number;
+}
+
+interface CrossingTrade {
   id: number;
   time: string;
   coin: string;
@@ -21,20 +29,9 @@ interface HftTrade {
   contracts: number | null;
   cost: number | null;
   reason?: string | null;
-}
-
-const STRATEGIES = [
-  { id: 'v12_5', name: 'V12-5 Delta', description: 'Price delta momentum, EP filter' },
-  { id: 'v12_6', name: 'V12-6 Momentum', description: 'Delta + Momentum match (delta dir == distance dir)' },
-] as const;
-
-interface CoinStat {
-  coin: string;
-  total: number;
-  wins: number;
-  losses: number;
-  paper_pnl: number;
-  win_rate: number;
+  orderbook_snapshot?: {
+    crossing?: CrossingInfo;
+  };
 }
 
 interface CandleStat {
@@ -48,8 +45,8 @@ interface CandleStat {
   outcomes: string | null;
 }
 
-interface HftData {
-  trades: HftTrade[];
+interface CrossingData {
+  trades: CrossingTrade[];
   overall: {
     total: number;
     pending: number;
@@ -60,24 +57,28 @@ interface HftData {
     paper_pnl: number;
     win_rate: number;
   };
-  coinStats: CoinStat[];
   candleStats: CandleStat[];
 }
 
-const COINS = ['btc'] as const;
+interface Props {
+  strategyName: string;
+  timeframe: '5m' | '15m';
+  candleMinutes: number;
+  maxCount: number;
+}
 
-export default function HftTab() {
-  const [data, setData] = useState<HftData | null>(null);
+export default function CrossingLimitTab({ strategyName, timeframe, candleMinutes, maxCount }: Props) {
+  const [data, setData] = useState<CrossingData | null>(null);
   const [loading, setLoading] = useState(true);
-  const [coinFilter, setCoinFilter] = useState<string>('btc');
-  const [strategyFilter, setStrategyFilter] = useState<string>('v12_5');
   const [selectedCandle, setSelectedCandle] = useState<string | null>(null);
-  const [candleTrades, setCandleTrades] = useState<HftTrade[]>([]);
+  const [candleTrades, setCandleTrades] = useState<CrossingTrade[]>([]);
   const [candleTradesLoading, setCandleTradesLoading] = useState(false);
+
+  const coinFilter = 'btc'; // BTC only
 
   const fetchData = useCallback(async () => {
     try {
-      const res = await fetch(`/api/paper-trading-hft?coin=${coinFilter}&strategy=${strategyFilter}`);
+      const res = await fetch(`/api/paper-trading-hft?coin=${coinFilter}&strategy=${strategyName}`);
       if (!res.ok) throw new Error('Failed to fetch');
       const json = await res.json();
       setData(json);
@@ -86,14 +87,13 @@ export default function HftTab() {
     } finally {
       setLoading(false);
     }
-  }, [coinFilter, strategyFilter]);
+  }, [strategyName]);
 
-  // 캔들 선택 시 해당 캔들의 trades를 별도로 fetch
   const fetchCandleTrades = useCallback(async (candleTime: string) => {
     setCandleTradesLoading(true);
     try {
       const res = await fetch(
-        `/api/paper-trading-hft?coin=${coinFilter}&strategy=${strategyFilter}&candle=${encodeURIComponent(candleTime)}`
+        `/api/paper-trading-hft?coin=${coinFilter}&strategy=${strategyName}&candle=${encodeURIComponent(candleTime)}`
       );
       if (!res.ok) throw new Error('Failed to fetch candle trades');
       const json = await res.json();
@@ -104,7 +104,7 @@ export default function HftTab() {
     } finally {
       setCandleTradesLoading(false);
     }
-  }, [coinFilter, strategyFilter]);
+  }, [strategyName]);
 
   useEffect(() => {
     setLoading(true);
@@ -113,7 +113,6 @@ export default function HftTab() {
     return () => clearInterval(interval);
   }, [fetchData]);
 
-  // 캔들 선택 변경 시 trades fetch
   useEffect(() => {
     if (selectedCandle) {
       fetchCandleTrades(selectedCandle);
@@ -122,17 +121,16 @@ export default function HftTab() {
     }
   }, [selectedCandle, fetchCandleTrades]);
 
-  // 현재 진행중인 캔들 시간 (실제 현재 시간 기준 계산) - candleGroups보다 먼저 정의
   const currentCandleTime = useMemo(() => {
     const now = new Date();
-    const minutes = now.getUTCMinutes();
-    const candleMinutes = Math.floor(minutes / 15) * 15;
+    const totalMinutes = now.getUTCHours() * 60 + now.getUTCMinutes();
+    const candleIndex = Math.floor(totalMinutes / candleMinutes);
+    const candleStartMinute = candleIndex * candleMinutes;
     const candleStart = new Date(now);
-    candleStart.setUTCMinutes(candleMinutes, 0, 0);
+    candleStart.setUTCHours(Math.floor(candleStartMinute / 60), candleStartMinute % 60, 0, 0);
     return candleStart.toISOString();
-  }, [data]); // data가 갱신될 때마다 현재 시간 기준으로 재계산
+  }, [data, candleMinutes]);
 
-  // Group candle stats by candle_start_time (useMemo로 이동)
   const candleGroups = useMemo(() => {
     const stats = data?.candleStats || [];
     const groups = stats.reduce((acc, stat) => {
@@ -148,7 +146,6 @@ export default function HftTab() {
       return acc;
     }, {} as Record<string, { up: CandleStat | null; down: CandleStat | null }>);
 
-    // 현재 캔들이 없으면 빈 행으로 추가 (LIVE 캔들 항상 표시)
     if (currentCandleTime && !groups[currentCandleTime]) {
       groups[currentCandleTime] = { up: null, down: null };
     }
@@ -156,23 +153,21 @@ export default function HftTab() {
     return groups;
   }, [data?.candleStats, currentCandleTime]);
 
-  // 진행중인 캔들 자동 선택 (첫 로드 또는 새 캔들 시작 시)
   useEffect(() => {
     if (currentCandleTime && selectedCandle !== currentCandleTime) {
-      // 현재 선택된 캔들이 없거나, 새 캔들이 시작된 경우 자동 선택
       if (!selectedCandle || !candleGroups[selectedCandle]) {
         setSelectedCandle(currentCandleTime);
       }
     }
   }, [currentCandleTime, candleGroups]);
 
-  // 15분 캔들별 PnL 차트 데이터 (시간순 정렬)
   const chartData = useMemo(() => {
     return Object.entries(candleGroups)
       .map(([candleTime, { up, down }]) => {
         const upPnl = Number(up?.pnl ?? 0);
         const downPnl = Number(down?.pnl ?? 0);
         const totalPnl = upPnl + downPnl;
+        const crossingCount = Number(up?.count ?? 0) + Number(down?.count ?? 0);
         return {
           time: candleTime,
           label: new Date(candleTime).toLocaleString('en-US', {
@@ -181,12 +176,12 @@ export default function HftTab() {
           pnl: totalPnl,
           upPnl,
           downPnl,
+          crossingCount,
         };
       })
       .sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
   }, [candleGroups]);
 
-  // 누적 PnL 계산
   const cumulativeData = useMemo(() => {
     let cumulative = 0;
     return chartData.map(d => {
@@ -195,9 +190,6 @@ export default function HftTab() {
     });
   }, [chartData]);
 
-  const currentStrategy = STRATEGIES.find(s => s.id === strategyFilter);
-
-  // 캔들별 양전/음전 카운트 계산
   const candlePnlStats = useMemo(() => {
     const entries = Object.entries(candleGroups);
     let profit = 0;
@@ -209,7 +201,7 @@ export default function HftTab() {
       else if (totalPnl < 0) loss++;
       else breakeven++;
     });
-    const total = profit + loss; // breakeven 제외
+    const total = profit + loss;
     const winRate = total > 0 ? (profit / total) * 100 : 0;
     return { profit, loss, breakeven, total: entries.length, winRate };
   }, [candleGroups]);
@@ -222,57 +214,37 @@ export default function HftTab() {
     return <div className="text-center py-10 text-red-500">Failed to load data</div>;
   }
 
-  const { trades, overall } = data;
+  const { overall } = data;
+  const colorClass = timeframe === '5m' ? 'text-purple-500' : 'text-cyan-500';
+  const bgColorClass = timeframe === '5m' ? 'bg-purple-600' : 'bg-cyan-600';
+  const chartColor = timeframe === '5m' ? '#a855f7' : '#06b6d4';
 
   return (
     <div className="space-y-6">
-      {/* Strategy Selector */}
-      <div className="flex items-center gap-4">
-        {STRATEGIES.map((strategy) => (
-          <button
-            key={strategy.id}
-            onClick={() => setStrategyFilter(strategy.id)}
-            className={`px-4 py-2 rounded-lg text-sm font-bold transition-colors ${
-              strategyFilter === strategy.id
-                ? 'bg-blue-600 text-white'
-                : 'bg-secondary text-muted-foreground hover:bg-secondary/80'
-            }`}
-          >
-            {strategy.name}
-          </button>
-        ))}
-      </div>
-
       {/* Strategy Info */}
       <div className="bg-card rounded-lg border border-border p-4">
         <h3 className="text-lg font-semibold mb-2">
-          {coinFilter.toUpperCase()} - {currentStrategy?.name ?? 'Unknown'} Strategy
+          BTC - Crossing Limit ({timeframe.toUpperCase()})
+          <span className={`ml-2 px-2 py-0.5 text-xs ${timeframe === '5m' ? 'bg-purple-500/20 text-purple-400' : 'bg-cyan-500/20 text-cyan-400'} rounded`}>
+            MAX {maxCount}x
+          </span>
         </h3>
         <div className="text-sm text-muted-foreground">
-          {currentStrategy?.description}
+          {timeframe === '5m' ? '5' : '15'}분봉 시작가(open) crossing 시 방향 베팅.
+          1회차 x10, 2-9회차 x20, 10회차 x10. <strong>최대 {maxCount}회</strong>, {timeframe === '5m' ? '4분 50초' : '14분 30초'} 이후 final round.
         </div>
       </div>
 
-      {/* Coin Tabs */}
+      {/* Coin Info */}
       <div className="flex items-center gap-2">
-        {COINS.map((coin) => (
-          <button
-            key={coin}
-            onClick={() => setCoinFilter(coin)}
-            className={`px-4 py-2 rounded-lg text-sm font-bold transition-colors ${
-              coinFilter === coin
-                ? 'bg-primary text-primary-foreground'
-                : 'bg-secondary text-muted-foreground hover:bg-secondary/80'
-            }`}
-          >
-            {coin.toUpperCase()}
-          </button>
-        ))}
+        <span className={`px-4 py-2 rounded-lg text-sm font-bold ${bgColorClass} text-white`}>
+          BTC
+        </span>
         <span className="text-sm text-muted-foreground ml-4">Auto-refresh 5s</span>
       </div>
 
       {/* Overall Stats */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
         <div className="p-4 bg-card rounded-lg border border-border">
           <div className="text-sm text-muted-foreground">Total Trades</div>
           <div className="text-2xl font-bold">{overall.total}</div>
@@ -286,7 +258,7 @@ export default function HftTab() {
             {candlePnlStats.winRate.toFixed(1)}%
           </div>
           <div className="text-xs text-muted-foreground mt-1">
-            양전:{candlePnlStats.profit} 음전:{candlePnlStats.loss}
+            +:{candlePnlStats.profit} -:{candlePnlStats.loss}
           </div>
         </div>
         <div className="p-4 bg-card rounded-lg border border-border">
@@ -296,18 +268,32 @@ export default function HftTab() {
           </div>
         </div>
         <div className="p-4 bg-card rounded-lg border border-border">
-          <div className="text-sm text-muted-foreground">Avg PnL/Trade</div>
-          <div className={`text-2xl font-bold ${Number(overall.paper_pnl ?? 0) / Math.max(overall.closed, 1) >= 0 ? 'text-green-500' : 'text-red-500'}`}>
-            ${(Number(overall.paper_pnl ?? 0) / Math.max(overall.closed, 1)).toFixed(3)}
+          <div className="text-sm text-muted-foreground">Avg PnL/Candle</div>
+          <div className={`text-2xl font-bold ${Number(overall.paper_pnl ?? 0) / Math.max(candlePnlStats.total, 1) >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+            ${(Number(overall.paper_pnl ?? 0) / Math.max(candlePnlStats.total, 1)).toFixed(2)}
+          </div>
+        </div>
+        <div className="p-4 bg-card rounded-lg border border-border">
+          <div className="text-sm text-muted-foreground">Live Crossings</div>
+          <div className={`text-2xl font-bold ${colorClass}`}>
+            {(() => {
+              const liveCandle = candleGroups[currentCandleTime];
+              if (!liveCandle) return 0;
+              return Number(liveCandle.up?.count ?? 0) + Number(liveCandle.down?.count ?? 0);
+            })()}
+            <span className="text-sm text-muted-foreground font-normal"> / {maxCount}</span>
+          </div>
+          <div className="text-xs text-muted-foreground mt-1">
+            UP: {Number(candleGroups[currentCandleTime]?.up?.count ?? 0)} | DOWN: {Number(candleGroups[currentCandleTime]?.down?.count ?? 0)}
           </div>
         </div>
       </div>
 
-      {/* 누적 PnL 라인 차트 */}
+      {/* Cumulative PnL Chart */}
       {cumulativeData.length > 0 && (
         <div className="bg-card rounded-lg border border-border p-4">
           <h3 className="text-lg font-semibold mb-3 flex items-center justify-between">
-            <span>누적 PnL 추이 (15분 단위)</span>
+            <span>Cumulative PnL ({timeframe} candles)</span>
             <span className={`text-xl font-bold ${(cumulativeData[cumulativeData.length - 1]?.cumulative ?? 0) >= 0 ? 'text-green-500' : 'text-red-500'}`}>
               ${(cumulativeData[cumulativeData.length - 1]?.cumulative ?? 0).toFixed(2)}
             </span>
@@ -329,7 +315,8 @@ export default function HftTab() {
                   contentStyle={{ backgroundColor: '#1f2937', border: '1px solid #374151', borderRadius: '8px' }}
                   labelStyle={{ color: '#9ca3af' }}
                   formatter={(value: number, name: string) => {
-                    if (name === 'cumulative') return [`$${value.toFixed(2)}`, '누적 PnL'];
+                    if (name === 'cumulative') return [`$${value.toFixed(2)}`, 'Cumulative PnL'];
+                    if (name === 'crossingCount') return [value, 'Crossings'];
                     return [`$${value.toFixed(2)}`, name];
                   }}
                 />
@@ -337,9 +324,9 @@ export default function HftTab() {
                 <Line
                   type="monotone"
                   dataKey="cumulative"
-                  stroke="#3b82f6"
+                  stroke={chartColor}
                   strokeWidth={2}
-                  dot={{ r: 3, fill: '#3b82f6' }}
+                  dot={{ r: 3, fill: chartColor }}
                   activeDot={{ r: 5 }}
                 />
               </LineChart>
@@ -348,25 +335,25 @@ export default function HftTab() {
         </div>
       )}
 
-      {/* Per-Candle Stats (15분봉별 UP/DOWN) */}
+      {/* Per-Candle Stats */}
       <div className="bg-card rounded-lg border border-border p-4">
-        <h3 className="text-lg font-semibold mb-3">15분봉별 UP/DOWN 통계</h3>
+        <h3 className="text-lg font-semibold mb-3">Per-Candle Crossing Stats</h3>
         <div className="overflow-x-auto max-h-80">
           <table className="w-full text-xs">
             <thead className="sticky top-0 bg-card">
               <tr className="border-b border-border">
                 <th className="text-left py-2 px-2">Candle Start</th>
-                <th className="text-center py-2 px-2 bg-green-500/10" colSpan={4}>UP</th>
-                <th className="text-center py-2 px-2 bg-red-500/10" colSpan={4}>DOWN</th>
+                <th className="text-center py-2 px-2 bg-green-500/10" colSpan={4}>UP (Cross Up)</th>
+                <th className="text-center py-2 px-2 bg-red-500/10" colSpan={4}>DOWN (Cross Down)</th>
                 <th className="text-right py-2 px-2">Total PnL</th>
               </tr>
               <tr className="border-b border-border text-muted-foreground">
                 <th className="text-left py-1 px-2"></th>
-                <th className="text-right py-1 px-2 bg-green-500/5">Qty</th>
+                <th className="text-right py-1 px-2 bg-green-500/5">#</th>
                 <th className="text-right py-1 px-2 bg-green-500/5">Avg$</th>
                 <th className="text-right py-1 px-2 bg-green-500/5">Cost</th>
                 <th className="text-right py-1 px-2 bg-green-500/5">PnL</th>
-                <th className="text-right py-1 px-2 bg-red-500/5">Qty</th>
+                <th className="text-right py-1 px-2 bg-red-500/5">#</th>
                 <th className="text-right py-1 px-2 bg-red-500/5">Avg$</th>
                 <th className="text-right py-1 px-2 bg-red-500/5">Cost</th>
                 <th className="text-right py-1 px-2 bg-red-500/5">PnL</th>
@@ -380,12 +367,13 @@ export default function HftTab() {
                   const upPnl = Number(up?.pnl ?? 0);
                   const downPnl = Number(down?.pnl ?? 0);
                   const totalPnl = upPnl + downPnl;
+                  const totalCrossings = Number(up?.count ?? 0) + Number(down?.count ?? 0);
                   return (
                     <tr
                       key={candleTime}
                       className={`border-b border-border/50 hover:bg-secondary/30 cursor-pointer ${
                         selectedCandle === candleTime ? 'bg-primary/20' : ''
-                      } ${candleTime === currentCandleTime ? 'border-l-2 border-l-yellow-500' : ''}`}
+                      } ${candleTime === currentCandleTime ? `border-l-2 ${timeframe === '5m' ? 'border-l-purple-500' : 'border-l-cyan-500'}` : ''}`}
                       onClick={() => setSelectedCandle(selectedCandle === candleTime ? null : candleTime)}
                     >
                       <td className="py-1.5 px-2 font-mono">
@@ -393,14 +381,19 @@ export default function HftTab() {
                           month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
                         })}
                         {candleTime === currentCandleTime && (
-                          <span className="ml-2 px-1.5 py-0.5 text-[10px] bg-yellow-500/20 text-yellow-400 rounded animate-pulse">
+                          <span className={`ml-2 px-1.5 py-0.5 text-[10px] ${timeframe === '5m' ? 'bg-purple-500/20 text-purple-400' : 'bg-cyan-500/20 text-cyan-400'} rounded animate-pulse`}>
                             LIVE
+                          </span>
+                        )}
+                        {totalCrossings > 0 && (
+                          <span className="ml-2 px-1.5 py-0.5 text-[10px] bg-blue-500/20 text-blue-400 rounded">
+                            x{totalCrossings}/{maxCount}
                           </span>
                         )}
                       </td>
                       {/* UP */}
                       <td className="text-right py-1.5 px-2 font-mono bg-green-500/5">
-                        {up ? Number(up.total_contracts).toLocaleString() : '-'}
+                        {up ? up.count : '-'}
                       </td>
                       <td className="text-right py-1.5 px-2 font-mono bg-green-500/5">
                         {up ? Number(up.avg_entry_price).toFixed(3) : '-'}
@@ -415,7 +408,7 @@ export default function HftTab() {
                       </td>
                       {/* DOWN */}
                       <td className="text-right py-1.5 px-2 font-mono bg-red-500/5">
-                        {down ? Number(down.total_contracts).toLocaleString() : '-'}
+                        {down ? down.count : '-'}
                       </td>
                       <td className="text-right py-1.5 px-2 font-mono bg-red-500/5">
                         {down ? Number(down.avg_entry_price).toFixed(3) : '-'}
@@ -449,7 +442,7 @@ export default function HftTab() {
             <span>
               {new Date(selectedCandle).toLocaleString('en-US', {
                 month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
-              })} 거래 상세 ({candleTrades.length}건)
+              })} Crossing Detail ({candleTrades.length})
             </span>
             <button
               onClick={() => setSelectedCandle(null)}
@@ -461,73 +454,79 @@ export default function HftTab() {
           {candleTradesLoading ? (
             <div className="text-center py-4 text-muted-foreground">Loading...</div>
           ) : candleTrades.length === 0 ? (
-            <div className="text-center py-4 text-muted-foreground">No trades for this candle</div>
+            <div className="text-center py-4 text-muted-foreground">No crossings for this candle</div>
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-xs">
                 <thead className="bg-secondary/50">
                   <tr className="border-b border-border">
                     <th className="text-left py-2 px-2">Time</th>
-                    <th className="text-left py-2 px-2">Coin</th>
-                    <th className="text-left py-2 px-2">Side</th>
-                    <th className="text-right py-2 px-2 text-green-400">UP Mid</th>
-                    <th className="text-right py-2 px-2 text-red-400">DN Mid</th>
+                    <th className="text-left py-2 px-2">#</th>
+                    <th className="text-left py-2 px-2">Direction</th>
+                    <th className="text-right py-2 px-2 text-yellow-400">Open</th>
+                    <th className="text-right py-2 px-2 text-muted-foreground">Prev</th>
+                    <th className="text-right py-2 px-2 text-blue-400">Curr</th>
                     <th className="text-right py-2 px-2">Entry$</th>
                     <th className="text-right py-2 px-2">Qty</th>
                     <th className="text-right py-2 px-2">Cost</th>
-                    <th className="text-left py-2 px-2">Reason</th>
                     <th className="text-left py-2 px-2">Status</th>
                     <th className="text-left py-2 px-2">Result</th>
                     <th className="text-right py-2 px-2">PnL</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {candleTrades.map((trade) => (
-                    <tr key={trade.id} className="border-b border-border/50 hover:bg-secondary/30">
-                      <td className="py-1.5 px-2 font-mono">{new Date(trade.time).toLocaleTimeString()}</td>
-                      <td className="py-1.5 px-2 font-bold">{trade.coin.toUpperCase()}</td>
-                      <td className={`py-1.5 px-2 font-bold ${trade.side === 'UP' ? 'text-green-500' : 'text-red-500'}`}>
-                        {trade.side}
-                      </td>
-                      <td className={`text-right py-1.5 px-2 font-mono ${trade.side === 'UP' ? 'bg-green-500/10 font-bold' : ''}`}>
-                        {trade.up_mid_price != null ? Number(trade.up_mid_price).toFixed(3) : '-'}
-                      </td>
-                      <td className={`text-right py-1.5 px-2 font-mono ${trade.side === 'DOWN' ? 'bg-red-500/10 font-bold' : ''}`}>
-                        {trade.down_mid_price != null ? Number(trade.down_mid_price).toFixed(3) : '-'}
-                      </td>
-                      <td className="text-right py-1.5 px-2 font-mono">{Number(trade.order_price).toFixed(3)}</td>
-                      <td className="text-right py-1.5 px-2 font-mono">{Number(trade.contracts ?? 0).toLocaleString()}</td>
-                      <td className="text-right py-1.5 px-2 font-mono">${Number(trade.cost ?? 0).toFixed(2)}</td>
-                      <td className="py-1.5 px-2 text-muted-foreground max-w-32 truncate" title={trade.reason ?? ''}>
-                        {trade.reason ?? '-'}
-                      </td>
-                      <td className="py-1.5 px-2">
-                        <span className={`px-1.5 py-0.5 rounded text-xs ${
-                          trade.status === 'CLOSED' ? 'bg-blue-500/20 text-blue-400' :
-                          trade.status === 'FILLED' ? 'bg-green-500/20 text-green-400' :
-                          trade.status === 'PENDING' ? 'bg-yellow-500/20 text-yellow-400' :
-                          'bg-gray-500/20 text-gray-400'
-                        }`}>
-                          {trade.status}
-                        </span>
-                      </td>
-                      <td className="py-1.5 px-2">
-                        {trade.outcome ? (
+                  {candleTrades.map((trade, idx) => {
+                    const crossing = trade.orderbook_snapshot?.crossing;
+                    // Extract entry number from reason like "CROSS5M_UP #3 @120s"
+                    const entryMatch = trade.reason?.match(/#(\d+)/);
+                    const entryNum = entryMatch ? entryMatch[1] : (idx + 1).toString();
+                    return (
+                      <tr key={trade.id} className="border-b border-border/50 hover:bg-secondary/30">
+                        <td className="py-1.5 px-2 font-mono">{new Date(trade.time).toLocaleTimeString()}</td>
+                        <td className="py-1.5 px-2 font-mono text-muted-foreground">#{entryNum}</td>
+                        <td className={`py-1.5 px-2 font-bold ${trade.side === 'UP' ? 'text-green-500' : 'text-red-500'}`}>
+                          {trade.side === 'UP' ? '↑ UP' : '↓ DN'}
+                        </td>
+                        <td className="text-right py-1.5 px-2 font-mono text-yellow-400">
+                          {crossing?.candle_open != null ? Number(crossing.candle_open).toLocaleString(undefined, {maximumFractionDigits: 2}) : '-'}
+                        </td>
+                        <td className="text-right py-1.5 px-2 font-mono text-muted-foreground">
+                          {crossing?.prev_price != null ? Number(crossing.prev_price).toLocaleString(undefined, {maximumFractionDigits: 2}) : '-'}
+                        </td>
+                        <td className="text-right py-1.5 px-2 font-mono text-blue-400">
+                          {crossing?.current_price != null ? Number(crossing.current_price).toLocaleString(undefined, {maximumFractionDigits: 2}) : '-'}
+                        </td>
+                        <td className="text-right py-1.5 px-2 font-mono">{Number(trade.order_price).toFixed(3)}</td>
+                        <td className="text-right py-1.5 px-2 font-mono">{Number(trade.contracts ?? 0).toLocaleString()}</td>
+                        <td className="text-right py-1.5 px-2 font-mono">${Number(trade.cost ?? 0).toFixed(2)}</td>
+                        <td className="py-1.5 px-2">
                           <span className={`px-1.5 py-0.5 rounded text-xs ${
-                            trade.outcome === 'WIN' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'
+                            trade.status === 'CLOSED' ? 'bg-blue-500/20 text-blue-400' :
+                            trade.status === 'FILLED' ? 'bg-green-500/20 text-green-400' :
+                            trade.status === 'PENDING' ? 'bg-yellow-500/20 text-yellow-400' :
+                            'bg-gray-500/20 text-gray-400'
                           }`}>
-                            {trade.outcome}
+                            {trade.status}
                           </span>
-                        ) : '-'}
-                      </td>
-                      <td className={`text-right py-1.5 px-2 font-mono ${
-                        trade.pnl === null ? '' :
-                        Number(trade.pnl) >= 0 ? 'text-green-500' : 'text-red-500'
-                      }`}>
-                        {trade.pnl !== null ? `$${Number(trade.pnl).toFixed(2)}` : '-'}
-                      </td>
-                    </tr>
-                  ))}
+                        </td>
+                        <td className="py-1.5 px-2">
+                          {trade.outcome ? (
+                            <span className={`px-1.5 py-0.5 rounded text-xs ${
+                              trade.outcome === 'WIN' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'
+                            }`}>
+                              {trade.outcome}
+                            </span>
+                          ) : '-'}
+                        </td>
+                        <td className={`text-right py-1.5 px-2 font-mono ${
+                          trade.pnl === null ? '' :
+                          Number(trade.pnl) >= 0 ? 'text-green-500' : 'text-red-500'
+                        }`}>
+                          {trade.pnl !== null ? `$${Number(trade.pnl).toFixed(2)}` : '-'}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

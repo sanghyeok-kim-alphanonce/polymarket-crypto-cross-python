@@ -97,20 +97,29 @@ export default function RealTradingPage() {
   const [selectedCandle, setSelectedCandle] = useState<string | null>(null);
   const [candleTrades, setCandleTrades] = useState<RealTrade[]>([]);
   const [candleTradesLoading, setCandleTradesLoading] = useState(false);
-  const [selectedStrategy, setSelectedStrategy] = useState<string>('all');
+  const [selectedStrategy, setSelectedStrategy] = useState<string>('');
+  const [strategiesLoaded, setStrategiesLoaded] = useState(false);
 
   const fetchData = useCallback(async () => {
     try {
-      const res = await fetch(`/api/real-trading?strategy=${encodeURIComponent(selectedStrategy)}`);
+      // 첫 로드시에는 전략 목록만 가져오기 위해 all로 요청
+      const strategyToFetch = selectedStrategy || 'all';
+      const res = await fetch(`/api/real-trading?strategy=${encodeURIComponent(strategyToFetch)}`);
       if (!res.ok) throw new Error('Failed to fetch');
       const json = await res.json();
       setData(json);
+
+      // 첫 로드시 첫 번째 전략 자동 선택
+      if (!strategiesLoaded && json.availableStrategies?.length > 0) {
+        setSelectedStrategy(json.availableStrategies[0].name);
+        setStrategiesLoaded(true);
+      }
     } catch (err) {
       console.error(err);
     } finally {
       setLoading(false);
     }
-  }, [selectedStrategy]);
+  }, [selectedStrategy, strategiesLoaded]);
 
   const fetchCandleTrades = useCallback(async (candleTime: string) => {
     setCandleTradesLoading(true);
@@ -254,21 +263,6 @@ export default function RealTradingPage() {
 
         {/* Strategy Tabs */}
         <div className="flex gap-2 flex-wrap">
-          <button
-            onClick={() => setSelectedStrategy('all')}
-            className={`px-4 py-2 rounded-lg font-medium transition-colors ${
-              selectedStrategy === 'all'
-                ? 'bg-red-500 text-white'
-                : 'bg-card border border-border hover:bg-secondary'
-            }`}
-          >
-            All Strategies
-            {data?.availableStrategies && (
-              <span className="ml-2 text-xs opacity-75">
-                ({data.availableStrategies.reduce((sum, s) => sum + s.tradeCount, 0)})
-              </span>
-            )}
-          </button>
           {(data?.availableStrategies || []).map((strategy) => (
             <button
               key={strategy.name}
@@ -289,9 +283,7 @@ export default function RealTradingPage() {
         <div className="bg-card rounded-lg border-2 border-red-500/50 p-4">
           <h3 className="text-lg font-semibold mb-2 flex items-center gap-2">
             <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse"></span>
-            {selectedStrategy === 'all'
-              ? 'All Real Trading Strategies'
-              : (data?.availableStrategies?.find(s => s.name === selectedStrategy)?.displayName || selectedStrategy)}
+            {data?.availableStrategies?.find(s => s.name === selectedStrategy)?.displayName || selectedStrategy || 'Loading...'}
             <span className="ml-2 px-2 py-0.5 text-xs bg-red-500/20 text-red-400 rounded">REAL MONEY</span>
           </h3>
           <div className="text-sm text-muted-foreground">
@@ -307,10 +299,13 @@ export default function RealTradingPage() {
             {selectedStrategy === 'real_trade_cross_14m_10limit' && (
               <>0-14분 crossing 전략. 10회 제한, 10회차 밸런싱(손실 최소화).</>
             )}
-            {selectedStrategy === 'all' && (
-              <>모든 전략의 통합 현황. 개별 전략별 상세 보기는 위 탭에서 선택하세요.</>
+            {selectedStrategy === 'real_trade_cross_limit_hedge' && (
+              <>15분봉 5분~14분 crossing 전략. 10회 제한, GTC @0.90.</>
             )}
-            {!['real_crossing', 'real_crossing_5m', 'real_crossing_v2', 'real_trade_cross_14m_10limit', 'all'].includes(selectedStrategy) && (
+            {selectedStrategy === 'real_trade_5m_cross_front' && (
+              <>5분봉 0~3분 초반 crossing 전략. 10회 제한, GTC @0.80.</>
+            )}
+            {selectedStrategy && !['real_crossing', 'real_crossing_5m', 'real_crossing_v2', 'real_trade_cross_14m_10limit', 'real_trade_cross_limit_hedge', 'real_trade_5m_cross_front'].includes(selectedStrategy) && (
               <>과거 전략 데이터</>
             )}
           </div>
