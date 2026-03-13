@@ -1,9 +1,10 @@
 """
-Real Trader Cross Limit Hedge: Crossing 전략 (횟수 제한 + 헤지)
+Real Trader Cross Limit: Crossing 전략 (횟수 제한)
 
 - 15분봉 전체 crossing에 진입
 - 10회 제한
-- 1회차: UNIT (10), 2~9회차: 2*UNIT (20), 10회차: UNIT (10) + hedge x HEDGE_UNIT (30)
+- 1회차: UNIT (10), 2~9회차: 2*UNIT (20), 10회차: UNIT (10)
+- 14분 30초 이후 → 바로 10회차
 - GTC 고정 0.70
 - Redis subscribe: ch:crossing:*, ch:orderbook:*, ch:candle_boundary:15m
 - 텔레그램 알림
@@ -21,10 +22,10 @@ import aiohttp
 
 from config import (
     STRATEGY_NAME, COINS, TIMEFRAMES,
-    CROSSING_BET_CONTRACT_UNIT, CROSSING_HEDGE_UNIT,
+    CROSSING_BET_CONTRACT_UNIT,
     CROSSING_MAX_COUNT, CROSSING_MIN_ELAPSED_SECONDS, CROSSING_CUTOFF_SECONDS,
-    CROSSING_HEDGE_MIN_REMAINING_SECONDS,
-    get_gtc_price, GTC_HEDGE_PRICE,
+    CROSSING_LATE_ENTRY_SECONDS, GTC_FIXED_PRICE,
+    get_gtc_price,
     POLYMARKET_HOST, POLYMARKET_CHAIN_ID,
     POLYMARKET_PRIVATE_KEY, POLYMARKET_PROXY_ADDRESS,
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
@@ -48,20 +49,20 @@ class TradeSignal:
     side: str
     reason: str
     contracts: int  # 주문 수량
-    is_hedge: bool = False  # 10회차 hedge (UP/DOWN 양쪽)
 
 
 class CrossingStrategy5M:
     """
-    15분봉 전체 Crossing 전략 (횟수 제한 + 헤지)
+    15분봉 전체 Crossing 전략 (횟수 제한)
     - 캔들당 최대 10회 진입
-    - 1회차: UNIT (4)
-    - 2~9회차: 2*UNIT (8)
-    - 10회차: UNIT (4) + hedge UP/DOWN x HEDGE_UNIT (5)
+    - 1회차: UNIT (10)
+    - 2~9회차: 2*UNIT (20)
+    - 10회차: UNIT (10)
+    - 14분 30초 이후 → 바로 10회차
     """
 
-    name = "crossing_limit_hedge"
-    description = "15분봉 전체 crossing에 GTC 진입 (UNIT/2*UNIT/UNIT+hedge, 10회 제한)"
+    name = "crossing_limit"
+    description = "15분봉 전체 crossing에 GTC 진입 (UNIT/2*UNIT/UNIT, 10회 제한)"
 
     def __init__(self):
         self.candle_state: Dict[str, Dict[str, Any]] = {}
@@ -110,15 +111,17 @@ class CrossingStrategy5M:
 
         side = "up" if crossing_direction == "up" else "down"
 
-        # 수량 결정: 1회차=UNIT, 2~9회차=2*UNIT, 10회차=UNIT (+ hedge 별도)
-        is_hedge = False
-        if state["count"] == 1:
-            contracts = CROSSING_BET_CONTRACT_UNIT  # 1회차: UNIT (4)
-        elif state["count"] == CROSSING_MAX_COUNT:
-            contracts = CROSSING_BET_CONTRACT_UNIT  # 10회차: UNIT (4)
-            is_hedge = True  # 10회차는 hedge 추가
+        # 10회차 판정: count == 10 OR elapsed >= 870초(14분 30초)
+        is_final_round = (state["count"] == CROSSING_MAX_COUNT) or (elapsed_seconds >= CROSSING_LATE_ENTRY_SECONDS)
+
+        # 수량 결정: 1회차=UNIT, 2~9회차=2*UNIT, 10회차=UNIT
+        if is_final_round:
+            contracts = CROSSING_BET_CONTRACT_UNIT  # 10회차: UNIT
+            state["count"] = CROSSING_MAX_COUNT  # 이후 진입 방지
+        elif state["count"] == 1:
+            contracts = CROSSING_BET_CONTRACT_UNIT  # 1회차: UNIT
         else:
-            contracts = CROSSING_BET_CONTRACT_UNIT * 2  # 2~9회차: 2*UNIT (8)
+            contracts = CROSSING_BET_CONTRACT_UNIT * 2  # 2~9회차: 2*UNIT
 
         reason = f"CROSS15M_{crossing_direction.upper()} #{state['count']} @{elapsed_seconds}s"
 
@@ -126,7 +129,6 @@ class CrossingStrategy5M:
             side=side,
             reason=reason,
             contracts=contracts,
-            is_hedge=is_hedge,
         )
 
     def get_status(self) -> Dict[str, Any]:
@@ -404,26 +406,13 @@ class RealTraderCross5MService(AsyncServiceBase):
                 "curr_elapsed_ms": data.get("curr_elapsed_ms"),
             }
 
-            # 일반 주문 실행 (1~10회 모두)
+            # 주문 실행 (1~10회)
             asyncio.create_task(self.execute_order(
                 coin, tf, signal, token_id,
                 candle_start, candle_end,
                 crossing_info=crossing_info,
                 candle_key=candle_key,
             ))
-
-            # 10회차면 추가로 hedge 주문 (UP+DOWN @0.45 maker)
-            # 단, 일정 시간 이상 남았을 때만 (maker 주문 체결 시간 확보)
-            if signal.is_hedge:
-                remaining_seconds = CROSSING_CUTOFF_SECONDS - elapsed_seconds
-                if remaining_seconds >= CROSSING_HEDGE_MIN_REMAINING_SECONDS:
-                    asyncio.create_task(self.execute_hedge_orders(
-                        coin, tf, signal, candle_start, candle_end,
-                        crossing_info=crossing_info,
-                        candle_key=candle_key,
-                    ))
-                else:
-                    logger.info(f"[{coin}] HEDGE skipped: only {remaining_seconds}s remaining (need {CROSSING_HEDGE_MIN_REMAINING_SECONDS}s+)")
 
     def get_orderbook(self, coin: str, timeframe: str, side: str = "up") -> Optional[Dict]:
         key = f"{coin}_{timeframe}_{side}"
@@ -437,102 +426,6 @@ class RealTraderCross5MService(AsyncServiceBase):
     # =========================================================================
     # Real Order Execution
     # =========================================================================
-    async def execute_hedge_orders(
-        self,
-        coin: str,
-        timeframe: str,
-        signal: TradeSignal,
-        candle_start: datetime,
-        candle_end: datetime,
-        crossing_info: Optional[Dict] = None,
-        candle_key: Optional[str] = None,
-    ):
-        """10회차 hedge: UP/DOWN 양쪽에 GTC 주문"""
-        contracts = CROSSING_HEDGE_UNIT  # hedge는 HEDGE_UNIT (5) 사용
-        reason = signal.reason
-
-        logger.info(f"[{coin}] HEDGE ORDER: placing GTC @{GTC_HEDGE_PRICE:.2f} on BOTH UP/DOWN x{contracts}")
-
-        # UP side orderbook
-        up_orderbook = self.get_orderbook(coin, timeframe, "up")
-        # DOWN side orderbook
-        down_orderbook = self.get_orderbook(coin, timeframe, "down")
-
-        if not up_orderbook or not down_orderbook:
-            logger.error(f"[{coin}] HEDGE: missing orderbook (up={bool(up_orderbook)}, down={bool(down_orderbook)})")
-            self.notify(f"❌ <b>HEDGE FAILED</b>\nMissing orderbook")
-            return
-
-        up_token_id = up_orderbook.get('token_id', '')
-        down_token_id = down_orderbook.get('token_id', '')
-
-        if not up_token_id or not down_token_id:
-            logger.error(f"[{coin}] HEDGE: missing token_id")
-            self.notify(f"❌ <b>HEDGE FAILED</b>\nMissing token_id")
-            return
-
-        # Place both orders
-        up_result = await self._place_gtc_order(
-            coin=coin,
-            token_id=up_token_id,
-            target_contracts=contracts,
-            gtc_price=GTC_HEDGE_PRICE,
-        )
-
-        down_result = await self._place_gtc_order(
-            coin=coin,
-            token_id=down_token_id,
-            target_contracts=contracts,
-            gtc_price=GTC_HEDGE_PRICE,
-        )
-
-        # Log results
-        up_filled = up_result.get("filled_contracts", 0)
-        down_filled = down_result.get("filled_contracts", 0)
-        up_price = up_result.get("fill_price", 0)
-        down_price = down_result.get("fill_price", 0)
-
-        logger.info(
-            f"[{coin}] HEDGE RESULT: UP filled={up_filled} @{up_price:.3f} | "
-            f"DOWN filled={down_filled} @{down_price:.3f}"
-        )
-
-        # Record trades
-        elapsed_seconds = crossing_info.get('elapsed_seconds', 0) if crossing_info else 0
-
-        # UP trade
-        up_signal = TradeSignal(side="up", reason=f"HEDGE_UP #{CROSSING_MAX_COUNT} @{elapsed_seconds}s", contracts=contracts, is_hedge=True)
-        await self._record_trade(
-            coin, timeframe, up_signal, up_result,
-            candle_start, candle_end, crossing_info,
-            up_result.get("total_latency_ms", 0)
-        )
-
-        # DOWN trade
-        down_signal = TradeSignal(side="down", reason=f"HEDGE_DOWN #{CROSSING_MAX_COUNT} @{elapsed_seconds}s", contracts=contracts, is_hedge=True)
-        await self._record_trade(
-            coin, timeframe, down_signal, down_result,
-            candle_start, candle_end, crossing_info,
-            down_result.get("total_latency_ms", 0)
-        )
-
-        # Telegram notification
-        candle_open = (crossing_info.get('candle_open') or 0) if crossing_info else 0
-
-        up_status = "✓" if up_result.get("success") else "✗"
-        down_status = "✓" if down_result.get("success") else "✗"
-
-        # elapsed_seconds를 m:ss 포맷으로
-        elapsed_min = elapsed_seconds // 60
-        elapsed_sec = elapsed_seconds % 60
-
-        self.notify(
-            f"#{CROSSING_MAX_COUNT} HEDGE | open {candle_open:,.2f}\n"
-            f"@{elapsed_min}:{elapsed_sec:02d}\n"
-            f"UP x{contracts} @{GTC_HEDGE_PRICE:.2f} → {up_filled:.0f} {up_status}\n"
-            f"DOWN x{contracts} @{GTC_HEDGE_PRICE:.2f} → {down_filled:.0f} {down_status}"
-        )
-
     async def execute_order(
         self,
         coin: str,
@@ -1162,13 +1055,13 @@ class RealTraderCross5MService(AsyncServiceBase):
     # =========================================================================
     async def run(self):
         logger.info("=" * 60)
-        logger.info("Real Trader Cross Limit Hedge: 15분봉 전체 Crossing 전략")
+        logger.info("Real Trader Cross Limit: 15분봉 전체 Crossing 전략")
         logger.info("=" * 60)
         logger.info(f"Strategy: {STRATEGY_NAME}")
-        logger.info(f"  1st: x{CROSSING_BET_CONTRACT_UNIT}, 2-9th: x{CROSSING_BET_CONTRACT_UNIT*2}, 10th: x{CROSSING_BET_CONTRACT_UNIT} + hedge x{CROSSING_HEDGE_UNIT}")
-        logger.info(f"  Max count: {CROSSING_MAX_COUNT}")
+        logger.info(f"  1st: x{CROSSING_BET_CONTRACT_UNIT}, 2-9th: x{CROSSING_BET_CONTRACT_UNIT*2}, 10th: x{CROSSING_BET_CONTRACT_UNIT}")
+        logger.info(f"  Max count: {CROSSING_MAX_COUNT} (14m30s+ → final round)")
         logger.info(f"  GTC price: fixed 0.70 (taker-like)")
-        logger.info(f"  Entry: {CROSSING_MIN_ELAPSED_SECONDS}s ~ {CROSSING_CUTOFF_SECONDS}s (15분 전체)")
+        logger.info(f"  Entry: {CROSSING_MIN_ELAPSED_SECONDS}s ~ {CROSSING_CUTOFF_SECONDS}s (5분 이후)")
         logger.info(f"Coins: {COINS} | Timeframes: {TIMEFRAMES}")
         logger.info(f"Telegram: {'enabled' if TELEGRAM_BOT_TOKEN else 'disabled'}")
         logger.info("=" * 60)
@@ -1176,11 +1069,15 @@ class RealTraderCross5MService(AsyncServiceBase):
         self._init_clob_client()
         if self.is_live_enabled:
             logger.info("LIVE TRADING ENABLED")
+            min_min = CROSSING_MIN_ELAPSED_SECONDS // 60
+            max_min = CROSSING_CUTOFF_SECONDS // 60
+            late_min = CROSSING_LATE_ENTRY_SECONDS // 60
+            late_sec = CROSSING_LATE_ENTRY_SECONDS % 60
             self.notify(
                 f"<b>[STARTUP]</b> {STRATEGY_NAME}\n"
-                f"Entry: 0m~15m (max {CROSSING_MAX_COUNT}x)\n"
-                f"1st: x{CROSSING_BET_CONTRACT_UNIT}, 2-9th: x{CROSSING_BET_CONTRACT_UNIT*2} @0.70\n"
-                f"10th: x{CROSSING_BET_CONTRACT_UNIT} + hedge x{CROSSING_HEDGE_UNIT} @{GTC_HEDGE_PRICE:.2f}\n"
+                f"Entry: {min_min}m~{max_min}m (max {CROSSING_MAX_COUNT}x)\n"
+                f"1st: x{CROSSING_BET_CONTRACT_UNIT}, 2-9th: x{CROSSING_BET_CONTRACT_UNIT*2}, 10th: x{CROSSING_BET_CONTRACT_UNIT} @{GTC_FIXED_PRICE}\n"
+                f"{late_min}m{late_sec}s+ → final round\n"
                 f"Live: ENABLED"
             )
         else:

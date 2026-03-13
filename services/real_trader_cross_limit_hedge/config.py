@@ -1,10 +1,11 @@
 """
-Real Trader Cross Limit Hedge: Crossing 전략 (횟수 제한 + 헤지)
+Real Trader Cross Limit: Crossing 전략 (횟수 제한)
 
-- 15분봉 전체 crossing에 진입
+- 5분 이후 crossing에만 진입 (0-5분 스킵)
 - 1회차: UNIT (10)
 - 2~9회차: 2*UNIT (20)
-- 10회차: UNIT (10) + hedge UP/DOWN x HEDGE_UNIT (30)
+- 10회차: UNIT (10)
+- 14분 30초 이후 → 바로 10회차
 - GTC 고정 0.70
 """
 import os
@@ -18,15 +19,13 @@ TIMEFRAMES = ["15m"]
 
 # === Crossing 전략 파라미터 ===
 CROSSING_BET_CONTRACT_UNIT = 10      # 기본 단위: 1회차=10, 2-9회차=20, 10회차=10
-CROSSING_HEDGE_UNIT = 30             # 10회차 hedge: UP/DOWN 각 30 contracts
 CROSSING_MAX_COUNT = 10              # 최대 진입 횟수
-CROSSING_HEDGE_MIN_REMAINING_SECONDS = 450  # hedge 최소 잔여 시간 (7분 30초)
-CROSSING_MIN_ELAPSED_SECONDS = 0     # 진입 시작 (0초부터)
+CROSSING_MIN_ELAPSED_SECONDS = 300   # 진입 시작 (5분부터)
 CROSSING_CUTOFF_SECONDS = 900        # 진입 마감 (15분)
+CROSSING_LATE_ENTRY_SECONDS = 870    # 14분 30초 이후 → 바로 10회차
 
 # === GTC 주문 설정 ===
-GTC_FIXED_PRICE = 0.70               # 1-10회차 주문 가격
-GTC_HEDGE_PRICE = 0.45               # 10회차 hedge 주문 가격
+GTC_FIXED_PRICE = 0.90               # 1-10회차 주문 가격
 
 def get_gtc_price(elapsed_seconds: int) -> float:
     """GTC 가격 반환 (고정 0.70)"""
