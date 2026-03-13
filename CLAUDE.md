@@ -7,29 +7,22 @@ Polymarket Binary Options Paper Trading 시스템. 멀티 프로세스 아키텍
 
 ```
 poly-test/
-├── docker-compose.yml      # DB + Redis + P1(rtds) + P2(binance_ws) + P4(paper_trader) + multi_exchange_stream
+├── docker-compose.yml      # DB + Redis + 모든 서비스
 ├── init.sql                # 테이블 스키마
 ├── pyproject.toml          # Python 의존성
 ├── ARCHITECT.md            # 상세 아키텍처 문서
 ├── services/
 │   ├── rtds/               # P1: Polymarket CLOB WS + RTDS WS + Chainlink REST
-│   │   ├── config.py
-│   │   ├── main.py
-│   │   └── Dockerfile
-│   ├── binance_ws/         # P2: Binance miniTicker + kline_1m
-│   │   ├── config.py
-│   │   ├── main.py
-│   │   └── Dockerfile
-│   ├── paper_trader/       # P4: 전략 실행 + 정산
-│   │   ├── config.py
-│   │   ├── main.py
-│   │   ├── Dockerfile
-│   │   └── strategies/     # v12_5.py 등
-│   └── multi_exchange_stream/  # 다중 거래소 수집 (Bybit/Gate/Bitget)
-│       ├── config.py
-│       ├── main.py
-│       └── Dockerfile
-├── packages/               # 공유 Python 패키지 (polymarket_common, orderbook_shared)
+│   ├── binance_ws/         # P2: Binance miniTicker + kline (5m/15m candle)
+│   ├── paper_trader/       # P4: delta momentum 전략 (v12_5)
+│   ├── paper_trader_cross_v2/          # Crossing V2 paper trading
+│   ├── paper_trader_cross_limit_15m/   # 15분봉 횟수 제한 crossing
+│   ├── paper_trader_cross_limit_5m/    # 5분봉 횟수 제한 crossing
+│   ├── real_trader_cross_limit_hedge/  # 15분봉 실거래 crossing
+│   ├── real_trader_5m_cross_front/     # 5분봉 초반 실거래 crossing
+│   └── multi_exchange_stream/          # 다중 거래소 수집 (Bybit/Gate/Bitget)
+├── packages/               # 공유 Python 패키지 (polymarket_common, orderbook_shared, strategy_config)
+├── scripts/                # 유틸리티 스크립트
 ├── backtest/               # 백테스트 모듈
 └── dashboard/              # Next.js 대시보드 (port 3839)
 ```
@@ -44,14 +37,29 @@ poly-test/
 
 ### P2: binance_ws (cointest-binance-ws)
 - Binance miniTicker: 실시간 가격 → candle tracking
-- Binance kline_1m: 1분봉 OHLCV
-- Redis pub/sub publish: `ch:candle:*`
+- Binance kline_1m: 1분봉 OHLCV → 5m/15m candle open 가격 계산
+- Redis pub/sub publish: `ch:candle:*`, `ch:crossing:*`
 
-### P4: paper_trader (cointest-paper-trader-v12-5)
+### Paper Traders
+**paper_trader (cointest-paper-trader-v12-5)**
+- Delta momentum 전략 (v12_5)
 - Redis subscribe: `ch:orderbook:*`, `ch:candle_boundary`
-- Event-driven 전략 실행 (v12_5)
-- 60초 주기 정산
-- P1 연결 끊김 감지 (30초 watchdog)
+
+**paper_trader_cross_v2**
+- 15분봉 Crossing V2 전략 (밸런싱 베팅)
+
+**paper_trader_cross_limit_15m / 5m**
+- 횟수 제한 crossing 전략 (캔들당 최대 10회)
+- 1회차: UNIT, 2~9회차: 2*UNIT, 10회차: UNIT
+
+### Real Traders
+**real_trader_cross_limit_hedge**
+- 15분봉 실거래 crossing (10회 제한)
+- Polymarket 실거래 연동, 텔레그램 알림
+
+**real_trader_5m_cross_front**
+- 5분봉 초반 crossing 실거래
+- Polymarket 실거래 연동
 
 ### Multi Exchange Stream (cointest-multi-exchange)
 - ccxt.pro WebSocket: Bybit, Gate, Bitget 실시간 가격/오더북
@@ -62,12 +70,14 @@ poly-test/
 
 | 채널 | 방향 | 빈도 |
 |------|------|------|
-| `ch:orderbook:{coin}_{tf}_{side}` | P1 → P4 | ~1000/sec |
-| `ch:candle_boundary` | P1 → P4 | 15분마다 |
+| `ch:orderbook:{coin}_{tf}_{side}` | P1 → traders | ~1000/sec |
+| `ch:candle_boundary:{tf}` | P1 → traders | 5분/15분마다 |
 | `ch:candle:{coin}_{tf}` | P2 → dashboard | ~8/sec |
+| `ch:crossing:{coin}_{tf}` | P2 → traders | crossing 발생시 |
 
-## 현재 전략: V12-5 Delta Momentum
+## 전략
 
+### V12-5 Delta Momentum (paper_trader)
 ```
 가격 delta 기반 모멘텀 전략
 - 가격 상승 → UP 토큰 매수
@@ -76,6 +86,16 @@ poly-test/
 - 전반(<=10분): 높은 delta threshold
 - 후반(>10분): Entry Price >= 0.55 + 낮은 threshold
 - Cooldown으로 과다 거래 방지 (5초)
+```
+
+### Crossing 횟수 제한 전략 (paper_trader_cross_limit_*, real_trader_*)
+```
+15분봉/5분봉 시작가 crossing 기반 전략
+- 가격이 캔들 시작가를 crossing하면 진입
+- 캔들당 최대 10회 진입 제한
+- 베팅 수량: 1회차=UNIT, 2~9회차=2*UNIT, 10회차=UNIT
+- 14분 30초 이후 (5분봉: 4분 30초) → 바로 10회차
+- GTC 고정가 0.70
 ```
 
 ## 실행 방법
