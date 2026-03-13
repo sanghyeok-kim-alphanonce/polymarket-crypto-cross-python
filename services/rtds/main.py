@@ -21,7 +21,7 @@ import aiohttp
 import websockets
 
 from config import (
-    COINS, TIMEFRAMES,
+    ORDERBOOK_COINS, PRICE_COINS, TIMEFRAMES,
     DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD,
     REDIS_HOST, REDIS_PORT,
     CHAINLINK_FEED_IDS, CHAINLINK_INTERVAL,
@@ -106,7 +106,7 @@ class RtdsService(AsyncServiceBase):
             loaded_markets = []
 
             async with aiohttp.ClientSession() as session:
-                for coin in COINS:
+                for coin in ORDERBOOK_COINS:
                     for timeframe in TIMEFRAMES:
                         # 각 타임프레임별로 올바른 캔들 시작 timestamp 계산
                         if override_timestamp:
@@ -985,7 +985,8 @@ class RtdsService(AsyncServiceBase):
         logger.info("=" * 60)
         logger.info("P1: RTDS (Real-Time Data Service) Starting")
         logger.info("=" * 60)
-        logger.info(f"Coins: {COINS}")
+        logger.info(f"Orderbook Coins: {ORDERBOOK_COINS}")
+        logger.info(f"Price Coins: {PRICE_COINS}")
         logger.info(f"Timeframes: {TIMEFRAMES}")
         logger.info("=" * 60)
 

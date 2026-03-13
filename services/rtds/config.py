@@ -6,7 +6,12 @@ Polymarket CLOB WebSocket + RTDS WebSocket + Chainlink REST
 import os
 
 # === 코인 설정 ===
-COINS = ['btc', 'eth', 'sol', 'xrp']
+# 오더북: BTC만 수집 (Polymarket CLOB WS)
+ORDERBOOK_COINS = ['btc']
+# 가격: 4개 코인 모두 수집 (RTDS + Chainlink)
+PRICE_COINS = ['btc', 'eth', 'sol', 'xrp']
+# 하위 호환용 (deprecated)
+COINS = ORDERBOOK_COINS
 TIMEFRAMES = ['5m', '15m']
 
 # === DB 설정 ===
