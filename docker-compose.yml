@@ -98,6 +98,9 @@ services:
       DB_PASSWORD: papertrade
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      # 디버깅용 텔레그램 (open 가격 전송)
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "test -f /tmp/healthy"]
@@ -394,6 +397,125 @@ services:
       DB_PASSWORD: papertrade
       # 전략 파라미터는 strategy_config 기본값 사용
     restart: unless-stopped
+
+  # ============================================================================
+  # Paper Trader Cross Limit 5M: 5분봉 Crossing 전략 (횟수 제한)
+  # - real_trader_cross_limit_hedge와 동일한 로직
+  # - 1회차: 10, 2-9회차: 20, 10회차: 10 (taker 체결)
+  # ============================================================================
+  paper_trader_cross_limit_5m:
+    build:
+      context: .
+      dockerfile: services/paper_trader_cross_limit_5m/Dockerfile
+    container_name: cointest-paper-trader-cross-limit-5m
+    depends_on:
+      paper_trade_db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rtds:
+        condition: service_started
+      binance_ws:
+        condition: service_started
+    environment:
+      PYTHONUNBUFFERED: "1"
+      DB_HOST: paper_trade_db
+      DB_PORT: 5432
+      DB_NAME: paper_trade
+      DB_USER: paper
+      DB_PASSWORD: papertrade
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/healthy"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+
+  # ============================================================================
+  # Paper Trader Cross Limit 15M: 15분봉 Crossing 전략 (횟수 제한)
+  # - real_trader_cross_limit_hedge와 동일한 로직
+  # - 1회차: 10, 2-9회차: 20, 10회차: 10 (taker 체결)
+  # ============================================================================
+  paper_trader_cross_limit_15m:
+    build:
+      context: .
+      dockerfile: services/paper_trader_cross_limit_15m/Dockerfile
+    container_name: cointest-paper-trader-cross-limit-15m
+    depends_on:
+      paper_trade_db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rtds:
+        condition: service_started
+      binance_ws:
+        condition: service_started
+    environment:
+      PYTHONUNBUFFERED: "1"
+      DB_HOST: paper_trade_db
+      DB_PORT: 5432
+      DB_NAME: paper_trade
+      DB_USER: paper
+      DB_PASSWORD: papertrade
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/healthy"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+
+  # ============================================================================
+  # Real Trader 5M Cross Front: 5분봉 초반 Crossing 전략
+  # - 0초~3분까지 진입 (CUTOFF_MINUTES 파라미터)
+  # - 10회 제한, 밸런싱 없음
+  # - GTC 0.80
+  # ============================================================================
+  real_trader_5m_cross_front:
+    build:
+      context: .
+      dockerfile: services/real_trader_5m_cross_front/Dockerfile
+    container_name: cointest-real-trader-5m-cross-front
+    depends_on:
+      paper_trade_db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rtds:
+        condition: service_started
+      binance_ws:
+        condition: service_started
+    environment:
+      PYTHONUNBUFFERED: "1"
+      # 인프라 (컨테이너 네트워크)
+      DB_HOST: paper_trade_db
+      DB_PORT: 5432
+      DB_NAME: paper_trade
+      DB_USER: paper
+      DB_PASSWORD: papertrade
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # Credentials (.env에서 가져옴)
+      POLYMARKET_PRIVATE_KEY: ${POLYMARKET_PRIVATE_KEY:-}
+      POLYMARKET_PROXY_ADDRESS: ${POLYMARKET_PROXY_ADDRESS:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      # 전략 파라미터
+      CUTOFF_MINUTES: "3"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/healthy"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+    profiles:
+      - real  # docker compose --profile real up 으로 실행
 
   # ============================================================================
   # Dozzle: Docker 로그 뷰어
