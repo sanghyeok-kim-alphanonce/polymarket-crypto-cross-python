@@ -8,7 +8,7 @@ import os
 STRATEGY_NAME = os.getenv("STRATEGY_NAME", "v12_5")
 
 # === 코인 설정 ===
-COINS = ['btc', 'eth', 'sol', 'xrp']
+COINS = ['btc']  # Paper trading은 BTC만
 TIMEFRAMES = ['15m']
 
 # === V12-5 전략 파라미터 ===
