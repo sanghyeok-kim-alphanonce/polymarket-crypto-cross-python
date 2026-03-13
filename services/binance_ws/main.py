@@ -19,10 +19,11 @@ import json
 import time
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import aiohttp
 
+import os
 from config import (
     COINS, TIMEFRAMES,
     BINANCE_SYMBOLS, BINANCE_WS_URL,
@@ -31,6 +32,10 @@ from config import (
     DB_FLUSH_INTERVAL, STATS_INTERVAL,
     CROSSING_SOURCE,
 )
+
+# Telegram (디버깅용)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 from service_common import AsyncServiceBase, setup_logging
 
 logger = setup_logging(__name__)
@@ -73,6 +78,10 @@ class BinanceWsService(AsyncServiceBase):
         # Crossing 이벤트 DB 버퍼
         self.crossing_buffer: List[Dict] = []
 
+        # Binance kline에서 가져온 정확한 캔들 open 가격
+        # {coin_tf: {"open": float, "candle_start": str}}
+        self.kline_opens: Dict[str, Dict] = {}
+
         # 통계
         self.stats = defaultdict(int)
         self.start_time = time.time()
@@ -88,7 +97,12 @@ class BinanceWsService(AsyncServiceBase):
     # =========================================================================
     def _get_candle_window(self, timeframe: str = '15m'):
         now = datetime.now(timezone.utc)
-        minutes = 15 if timeframe == '15m' else 60
+        if timeframe == '5m':
+            minutes = 5
+        elif timeframe == '15m':
+            minutes = 15
+        else:
+            minutes = 60
         total_min = now.hour * 60 + now.minute
         start_min = (total_min // minutes) * minutes
         start = now.replace(hour=start_min // 60, minute=start_min % 60, second=0, microsecond=0)
@@ -96,21 +110,32 @@ class BinanceWsService(AsyncServiceBase):
         return start, end
 
     def _get_or_create_candle(self, coin: str, tf: str, price: float) -> Dict:
-        """캔들 가져오거나 새로 생성"""
+        """캔들 가져오거나 새로 생성 (kline에서 정확한 open 사용)"""
         key = f"{coin}_{tf}"
         candle_start, candle_end = self._get_candle_window(tf)
+        candle_start_str = candle_start.isoformat()
 
         candle = self.binance_candles.get(key)
-        if not candle or candle["candle_start"] != candle_start.isoformat():
+        if not candle or candle["candle_start"] != candle_start_str:
             # 새 캔들 시작 → price_zone 초기화
             if key in self.price_zone_mini:
                 del self.price_zone_mini[key]
             if key in self.price_zone_agg:
                 del self.price_zone_agg[key]
 
+            # kline에서 정확한 open 가격 가져오기
+            kline_data = self.kline_opens.get(key)
+            if kline_data and kline_data.get("candle_start") == candle_start_str:
+                open_price = kline_data["open"]
+            else:
+                # kline 데이터 없으면 첫 tick 가격 사용 (fallback)
+                open_price = price
+                logger.warning(f"[{coin}/{tf}] No kline open, using tick price {price:.2f}")
+
             candle = {
-                "open": price, "high": price, "low": price, "close": price,
-                "volume": 0, "candle_start": candle_start.isoformat(),
+                "open": open_price, "high": max(open_price, price),
+                "low": min(open_price, price), "close": price,
+                "volume": 0, "candle_start": candle_start_str,
                 "candle_end": candle_end.isoformat(),
             }
             self.binance_candles[key] = candle
@@ -370,7 +395,7 @@ class BinanceWsService(AsyncServiceBase):
     # Binance WebSocket Streams
     # =========================================================================
     async def start_binance_stream(self):
-        """miniTicker + kline_1m 스트림"""
+        """miniTicker + kline_1m 스트림 (1분봉 closed로 5m/15m open 대체)"""
         streams = []
         for symbol in BINANCE_SYMBOLS.values():
             streams.append(f"{symbol.lower()}@miniTicker")
@@ -423,22 +448,86 @@ class BinanceWsService(AsyncServiceBase):
 
                                 elif "@kline" in stream:
                                     kline = payload.get("k", {})
-                                    if kline.get("x"):
-                                        symbol = kline.get("s", "").lower()
-                                        coin = symbol_to_coin.get(symbol)
-                                        if coin:
-                                            ohlcv = {
-                                                "time": datetime.fromtimestamp(kline["t"] / 1000, tz=timezone.utc),
-                                                "coin": coin,
-                                                "open": float(kline["o"]),
-                                                "high": float(kline["h"]),
-                                                "low": float(kline["l"]),
-                                                "close": float(kline["c"]),
-                                                "volume": float(kline["v"]),
+                                    symbol = kline.get("s", "").lower()
+                                    coin = symbol_to_coin.get(symbol)
+                                    interval = kline.get("i", "")  # "1m"
+
+                                    # 1분봉 종료 시 처리
+                                    if coin and kline.get("x") and interval == "1m":
+                                        kline_close_time_ms = kline.get("T", 0)  # 캔들 종료 시간
+                                        close_price = float(kline["c"])
+                                        now_ms = int(time.time() * 1000)
+
+                                        # 다음 캔들 시작 시간 계산 (1분봉 종료 + 1ms = 다음 캔들 시작)
+                                        next_candle_start_ms = kline_close_time_ms + 1
+                                        next_candle_start = datetime.fromtimestamp(next_candle_start_ms / 1000, tz=timezone.utc)
+                                        next_minute = next_candle_start.minute
+
+                                        # 5분봉 경계 체크 (00, 05, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55)
+                                        if next_minute % 5 == 0:
+                                            key_5m = f"{coin}_5m"
+                                            candle_start_5m = next_candle_start.isoformat()
+                                            self.kline_opens[key_5m] = {
+                                                "open": close_price,
+                                                "candle_start": candle_start_5m,
                                             }
-                                            self.binance_ohlcv[coin] = ohlcv
-                                            self.stats["binance_ohlcv"] += 1
-                                            self.ohlcv_buffer.append(ohlcv)
+                                            delay_ms = now_ms - kline_close_time_ms
+                                            now_str = datetime.now(timezone.utc).strftime('%H:%M:%S.%f')[:-3]
+                                            logger.info(f"[KLINE-1M] {coin}/5m OPEN={close_price:.2f} | kline_close={kline_close_time_ms} now={now_ms} delay={delay_ms}ms | {now_str}")
+
+                                            # 기존 캔들 교정
+                                            candle = self.binance_candles.get(key_5m)
+                                            if candle and candle.get("candle_start") == candle_start_5m:
+                                                old_open = candle["open"]
+                                                if abs(old_open - close_price) > 0.01:
+                                                    candle["open"] = close_price
+                                                    logger.info(f"[KLINE-1M] {coin}/5m CORRECTED {old_open:.2f} -> {close_price:.2f}")
+
+                                            # BTC만 텔레그램 전송
+                                            if coin == "btc":
+                                                asyncio.create_task(self._send_open_telegram(
+                                                    coin, "5m", close_price, candle_start_5m, delay_ms, now_str
+                                                ))
+
+                                        # 15분봉 경계 체크 (00, 15, 30, 45)
+                                        if next_minute % 15 == 0:
+                                            key_15m = f"{coin}_15m"
+                                            candle_start_15m = next_candle_start.isoformat()
+                                            self.kline_opens[key_15m] = {
+                                                "open": close_price,
+                                                "candle_start": candle_start_15m,
+                                            }
+                                            delay_ms = now_ms - kline_close_time_ms
+                                            now_str = datetime.now(timezone.utc).strftime('%H:%M:%S.%f')[:-3]
+                                            logger.info(f"[KLINE-1M] {coin}/15m OPEN={close_price:.2f} | kline_close={kline_close_time_ms} now={now_ms} delay={delay_ms}ms | {now_str}")
+
+                                            # 기존 캔들 교정
+                                            candle = self.binance_candles.get(key_15m)
+                                            if candle and candle.get("candle_start") == candle_start_15m:
+                                                old_open = candle["open"]
+                                                if abs(old_open - close_price) > 0.01:
+                                                    candle["open"] = close_price
+                                                    logger.info(f"[KLINE-1M] {coin}/15m CORRECTED {old_open:.2f} -> {close_price:.2f}")
+
+                                            # BTC만 텔레그램 전송
+                                            if coin == "btc":
+                                                asyncio.create_task(self._send_open_telegram(
+                                                    coin, "15m", close_price, candle_start_15m, delay_ms, now_str
+                                                ))
+
+                                        # DB 저장 (기존 로직)
+                                        ohlcv = {
+                                            "time": datetime.fromtimestamp(kline["t"] / 1000, tz=timezone.utc),
+                                            "coin": coin,
+                                            "open": float(kline["o"]),
+                                            "high": float(kline["h"]),
+                                            "low": float(kline["l"]),
+                                            "close": close_price,
+                                            "volume": float(kline["v"]),
+                                        }
+                                        self.binance_ohlcv[coin] = ohlcv
+                                        self.stats["binance_ohlcv"] += 1
+                                        self.ohlcv_buffer.append(ohlcv)
 
                             elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
                                 break
@@ -497,6 +586,28 @@ class BinanceWsService(AsyncServiceBase):
                 await self.flush_buffers()
             except Exception as e:
                 logger.error(f"DB flush error: {e}")
+
+    async def _send_open_telegram(self, coin: str, tf: str, open_price: float,
+                                    candle_start: str, delay_ms: int, now_str: str):
+        """캔들 open 가격 텔레그램 전송 (디버깅용)"""
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+            return
+        try:
+            msg = (
+                f"<b>[{tf.upper()} OPEN]</b> {coin.upper()}\n"
+                f"open: <b>{open_price:,.2f}</b>\n"
+                f"candle: {candle_start}\n"
+                f"delay: {delay_ms}ms | {now_str}"
+            )
+            async with aiohttp.ClientSession() as session:
+                url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+                await session.post(url, json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": msg,
+                    "parse_mode": "HTML"
+                }, timeout=aiohttp.ClientTimeout(total=5))
+        except Exception as e:
+            logger.error(f"Telegram send error: {e}")
 
     async def flush_buffers(self):
         prices = list(self.price_buffer)

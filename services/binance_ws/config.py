@@ -5,7 +5,7 @@ import os
 
 # === 코인 설정 ===
 COINS = ['btc', 'eth', 'sol', 'xrp']
-TIMEFRAMES = ['15m']
+TIMEFRAMES = ['5m', '15m']
 
 # === Binance 설정 ===
 BINANCE_SYMBOLS = {
