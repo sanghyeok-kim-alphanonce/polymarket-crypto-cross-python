@@ -101,6 +101,7 @@ services:
       # 디버깅용 텔레그램 (open 가격 전송)
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_THREAD_ID: ${TELEGRAM_THREAD_ID:-}
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "test -f /tmp/healthy"]
@@ -305,6 +306,7 @@ services:
       POLYMARKET_PROXY_ADDRESS: ${POLYMARKET_PROXY_ADDRESS:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_THREAD_ID: ${TELEGRAM_THREAD_ID:-}
       # 전략 파라미터는 config.py 기본값 사용
     restart: unless-stopped
     healthcheck:
@@ -337,10 +339,11 @@ services:
       ACCOUNT_1_PROXY_ADDRESS: ${POLYMARKET_PROXY_ADDRESS:-}
       ACCOUNT_1_NAME: main
       # 설정
-      CLAIM_INTERVAL: 300
+      CLAIM_INTERVAL: 3600
       # Telegram 알림
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_THREAD_ID: ${TELEGRAM_THREAD_ID:-}
     restart: unless-stopped
     profiles:
       - real  # docker compose --profile real up 으로 실행
@@ -370,32 +373,6 @@ services:
       DB_PASSWORD: papertrade
       REDIS_HOST: redis
       REDIS_PORT: 6379
-    restart: unless-stopped
-
-  # ============================================================================
-  # Backtest API (FastAPI)
-  # - paper_trader의 strategies/ 코드를 공유하여 백테스트 실행
-  # - 대시보드 /backtest 페이지에서 호출
-  # ============================================================================
-  backtest_api:
-    build:
-      context: .
-      dockerfile: services/backtest_api/Dockerfile
-    container_name: cointest-backtest-api
-    ports:
-      - "3842:8000"
-    depends_on:
-      paper_trade_db:
-        condition: service_healthy
-    environment:
-      PYTHONUNBUFFERED: "1"
-      # 인프라 (컨테이너 네트워크)
-      DB_HOST: paper_trade_db
-      DB_PORT: 5432
-      DB_NAME: paper_trade
-      DB_USER: paper
-      DB_PASSWORD: papertrade
-      # 전략 파라미터는 strategy_config 기본값 사용
     restart: unless-stopped
 
   # ============================================================================
@@ -505,6 +482,7 @@ services:
       POLYMARKET_PROXY_ADDRESS: ${POLYMARKET_PROXY_ADDRESS:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_THREAD_ID: ${TELEGRAM_THREAD_ID:-}
       # 전략 파라미터
       CUTOFF_MINUTES: "3"
     restart: unless-stopped
@@ -516,6 +494,80 @@ services:
       start_period: 15s
     profiles:
       - real  # docker compose --profile real up 으로 실행
+
+  # ============================================================================
+  # Real Trader 5M Improve: cooltime + pending 로직 적용
+  # - 거래 후 1초 cooltime, cooltime 중 마지막 crossing만 저장
+  # - cooltime 종료 후 반대 방향이면 실행
+  # - GTC 0.80 고정
+  # ============================================================================
+  real_trader_5m_improve:
+    build:
+      context: .
+      dockerfile: services/real_trader_5m_improve/Dockerfile
+    container_name: cointest-real-trader-5m-improve
+    depends_on:
+      paper_trade_db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rtds:
+        condition: service_started
+      binance_ws:
+        condition: service_started
+    environment:
+      PYTHONUNBUFFERED: "1"
+      # 인프라 (컨테이너 네트워크)
+      DB_HOST: paper_trade_db
+      DB_PORT: 5432
+      DB_NAME: paper_trade
+      DB_USER: paper
+      DB_PASSWORD: papertrade
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # Credentials (.env에서 가져옴)
+      POLYMARKET_PRIVATE_KEY: ${POLYMARKET_PRIVATE_KEY:-}
+      POLYMARKET_PROXY_ADDRESS: ${POLYMARKET_PROXY_ADDRESS:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_THREAD_ID: ${TELEGRAM_THREAD_ID:-}
+      # HTTP timeout for CLOB API (default: 15 seconds)
+      CLOB_HTTP_TIMEOUT: "15"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/healthy"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+    profiles:
+      - real  # docker compose --profile real up 으로 실행
+
+  # ============================================================================
+  # Latency Monitor: Redis pub/sub 지연 시간 측정
+  # - Binance event time vs 현재 시간 비교
+  # - crossing/candle 이벤트 latency 출력
+  # ============================================================================
+  latency_monitor:
+    build:
+      context: ./services/latency_monitor
+      dockerfile: Dockerfile
+    container_name: cointest-latency-monitor
+    depends_on:
+      redis:
+        condition: service_healthy
+      binance_ws:
+        condition: service_started
+    environment:
+      PYTHONUNBUFFERED: "1"
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_THREAD_ID: ${TELEGRAM_THREAD_ID:-}
+    restart: "no"  # 테스트용이므로 재시작 안 함
+    profiles:
+      - test  # docker compose --profile test up latency_monitor
 
   # ============================================================================
   # Dozzle: Docker 로그 뷰어

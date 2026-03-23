@@ -36,6 +36,7 @@ from config import (
 # Telegram (디버깅용)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_THREAD_ID = os.getenv("TELEGRAM_THREAD_ID", "")
 from service_common import AsyncServiceBase, setup_logging
 
 logger = setup_logging(__name__)
@@ -240,6 +241,9 @@ class BinanceWsService(AsyncServiceBase):
             "up_count": up_count,
             "down_count": down_count,
             "elapsed_ms": elapsed_ms,
+            # Latency 측정용: Binance 원본 event time
+            "binance_event_ms": event_time_ms,
+            "server_recv_ms": int(now.timestamp() * 1000),
         }
 
         # 채널 결정
@@ -319,6 +323,7 @@ class BinanceWsService(AsyncServiceBase):
             direction = "up" if price > candle["open"] else ("down" if price < candle["open"] else "flat")
             pct = ((price - candle["open"]) / candle["open"] * 100) if candle["open"] else 0
 
+            now = datetime.now(timezone.utc)
             redis_data = {
                 "coin": coin, "timeframe": tf, "direction": direction,
                 "open": candle["open"], "high": candle["high"],
@@ -326,11 +331,14 @@ class BinanceWsService(AsyncServiceBase):
                 "volume": candle["volume"], "price_change_pct": round(pct, 4),
                 "candle_start": candle["candle_start"],
                 "candle_end": candle["candle_end"],
-                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": now.isoformat(),
                 # V12-5 전략용 1초 delta
                 "delta_1s": delta_1s,
                 "prev_price": prev_price,
                 "delta_time_ms": delta_time_ms,
+                # Latency 측정용: Binance 원본 event time
+                "binance_event_ms": event_time_ms,
+                "server_recv_ms": int(now.timestamp() * 1000),
             }
 
             try:
@@ -601,11 +609,14 @@ class BinanceWsService(AsyncServiceBase):
             )
             async with aiohttp.ClientSession() as session:
                 url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-                await session.post(url, json={
+                payload = {
                     "chat_id": TELEGRAM_CHAT_ID,
                     "text": msg,
                     "parse_mode": "HTML"
-                }, timeout=aiohttp.ClientTimeout(total=5))
+                }
+                if TELEGRAM_THREAD_ID:
+                    payload["message_thread_id"] = int(TELEGRAM_THREAD_ID)
+                await session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5))
         except Exception as e:
             logger.error(f"Telegram send error: {e}")
 

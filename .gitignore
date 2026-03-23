@@ -38,6 +38,9 @@ backtest/results/*.json
 # Data exports
 exports/
 
+# Tick data (large CSV files)
+binance-tick-data/
+
 # Environment
 .env.local
 .env.*.local
