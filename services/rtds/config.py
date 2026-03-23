@@ -51,3 +51,6 @@ CHAINLINK_INTERVAL = 10
 # === 수집 간격 ===
 DB_FLUSH_INTERVAL = 5
 STATS_INTERVAL = 60
+
+# === DB 저장 설정 ===
+SAVE_ORDERBOOK_TO_DB = False  # orderbook_books, orderbook_changes 저장 비활성화

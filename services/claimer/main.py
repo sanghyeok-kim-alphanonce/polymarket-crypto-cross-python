@@ -64,6 +64,7 @@ logger = logging.getLogger(__name__)
 # Telegram notifications
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_THREAD_ID = os.environ.get("TELEGRAM_THREAD_ID", "")
 
 
 async def tg_send(text: str):
@@ -71,10 +72,13 @@ async def tg_send(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+        if TELEGRAM_THREAD_ID:
+            payload["message_thread_id"] = int(TELEGRAM_THREAD_ID)
         async with httpx.AsyncClient(timeout=10) as client:
             await client.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+                json=payload,
             )
     except Exception:
         pass

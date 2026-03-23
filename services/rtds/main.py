@@ -30,6 +30,7 @@ from config import (
     RTDS_SYMBOL_MAP, RTDS_RECONNECT_DELAY,
     DB_FLUSH_INTERVAL, STATS_INTERVAL,
     GAMMA_API,
+    SAVE_ORDERBOOK_TO_DB,
 )
 
 # Packages
@@ -935,7 +936,7 @@ class RtdsService(AsyncServiceBase):
                     logger.error(f"Flush coin_prices error: {e}")
 
             # --- orderbook_books ---
-            if ob_books:
+            if SAVE_ORDERBOOK_TO_DB and ob_books:
                 try:
                     await conn.executemany("""
                         INSERT INTO orderbook_books (time, coin, timeframe, side, bids, asks, market_slug, token_id)
@@ -948,7 +949,7 @@ class RtdsService(AsyncServiceBase):
                     logger.error(f"Flush orderbook books error: {e}")
 
             # --- orderbook_changes ---
-            if ob_changes:
+            if SAVE_ORDERBOOK_TO_DB and ob_changes:
                 try:
                     await conn.executemany("""
                         INSERT INTO orderbook_changes (time, token_id, price, size, book_side)

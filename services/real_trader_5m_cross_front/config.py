@@ -40,6 +40,7 @@ POLYMARKET_PROXY_ADDRESS = os.getenv("POLYMARKET_PROXY_ADDRESS", "")
 # === Telegram 설정 ===
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_THREAD_ID = os.getenv("TELEGRAM_THREAD_ID", "")
 
 # === DB 설정 ===
 DB_HOST = os.getenv("DB_HOST", "paper_trade_db")

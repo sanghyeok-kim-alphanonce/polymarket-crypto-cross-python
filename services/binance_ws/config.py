@@ -31,6 +31,9 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 DB_FLUSH_INTERVAL = 5
 STATS_INTERVAL = 60
 
+# === Telegram 설정 ===
+TELEGRAM_THREAD_ID = os.getenv("TELEGRAM_THREAD_ID", "")
+
 # === Crossing 설정 ===
 # "agg" = aggTrade 사용 (빠름, 권장)
 # "mini" = miniTicker 사용 (느림, will be deprecated)

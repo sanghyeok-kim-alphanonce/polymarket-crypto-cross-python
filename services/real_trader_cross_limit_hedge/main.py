@@ -28,7 +28,7 @@ from config import (
     get_gtc_price,
     POLYMARKET_HOST, POLYMARKET_CHAIN_ID,
     POLYMARKET_PRIVATE_KEY, POLYMARKET_PROXY_ADDRESS,
-    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_THREAD_ID,
     DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD,
     REDIS_HOST, REDIS_PORT,
     STATS_INTERVAL,
@@ -217,11 +217,14 @@ class RealTraderCross5MService(AsyncServiceBase):
                 try:
                     msg = await self.telegram_queue.get()
                     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-                    await session.post(url, json={
+                    payload = {
                         "chat_id": TELEGRAM_CHAT_ID,
                         "text": msg,
                         "parse_mode": "HTML"
-                    }, timeout=aiohttp.ClientTimeout(total=10))
+                    }
+                    if TELEGRAM_THREAD_ID:
+                        payload["message_thread_id"] = int(TELEGRAM_THREAD_ID)
+                    await session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10))
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
