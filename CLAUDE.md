@@ -100,9 +100,30 @@ poly-test/
 
 ## 실행 방법
 
+### ⚠️ 중요: 환경변수 충돌 방지
+
+`claudeCodeTelegram` 환경에서 실행 시, 셸에 `TELEGRAM_BOT_TOKEN` 등이 export 되어 있어 `.env` 파일 값이 무시될 수 있다.
+**반드시 `.env` 파일을 명시적으로 export 후 실행**:
+
+```bash
+# poly-test 서비스 실행 전 필수
+cd /home/yeonwoo/poly-test
+export $(grep -v '^#' .env | xargs)
+
+# 그 후 docker compose 실행
+docker compose up -d --build
+```
+
+또는 한 줄로:
+```bash
+cd /home/yeonwoo/poly-test && export $(grep -v '^#' .env | xargs) && docker compose up -d --build
+```
+
+### 일반 실행
+
 ```bash
 # 1. 전체 서비스 실행
-cd poly-test && docker compose up -d --build
+cd poly-test && export $(grep -v '^#' .env | xargs) && docker compose up -d --build
 
 # 2. Dashboard (별도 터미널)
 cd poly-test/dashboard && bun run dev -- -p 3839
