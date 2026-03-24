@@ -709,7 +709,7 @@ class RealTrader5MCrossFrontService(AsyncServiceBase):
                 f"<b>[5M]</b> {entry_label} {cross_dir} | open {candle_open:,.2f}\n"
                 f"{prev_time_str} -> {curr_time_str}\n"
                 f"{prev_price:,.2f} -> {curr_price:,.2f}\n"
-                f"x{contracts} @{fill_price:.2f} {filled:.0f}/{target} {status_mark}"
+                f"x{contracts} @{fill_price:.2f} {filled:.0f}/{target} {status_mark} | {latency_ms:.0f}ms"
             )
         else:
             self.stats["orders_failed"] += 1
@@ -724,7 +724,7 @@ class RealTrader5MCrossFrontService(AsyncServiceBase):
                 f"<b>[5M]</b> {entry_label} {cross_dir} | open {candle_open:,.2f}\n"
                 f"{prev_time_str} -> {curr_time_str}\n"
                 f"{prev_price:,.2f} -> {curr_price:,.2f}\n"
-                f"x{contracts} FAILED: {error}"
+                f"x{contracts} FAILED: {error} | {latency_ms:.0f}ms"
             )
 
     async def _cooltime_timer(
