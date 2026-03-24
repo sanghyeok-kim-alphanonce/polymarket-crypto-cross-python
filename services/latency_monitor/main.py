@@ -136,8 +136,8 @@ class LatencyMonitor:
             print("[DIRECT-WS] Reconnecting in 5s...")
             await asyncio.sleep(5)
 
-    async def subscribe_redis(self):
-        """Redis pub/sub 구독 (ch:candle:*)"""
+    async def subscribe_redis_candle(self):
+        """Redis pub/sub 구독 (ch:candle:*) - latency 측정용"""
         pubsub = self.redis_client.pubsub()
         await pubsub.psubscribe("ch:candle:*")
         print("[REDIS-SUB] Listening to ch:candle:*")
@@ -201,6 +201,59 @@ class LatencyMonitor:
                 except Exception as e:
                     print(f"[REDIS-SUB] Error: {e}")
 
+    async def subscribe_redis_crossing(self):
+        """Redis pub/sub 구독 (ch:crossing:*) - crossing 이벤트 텔레그램 전송"""
+        pubsub = self.redis_client.pubsub()
+        await pubsub.psubscribe("ch:crossing:*")
+        print("[REDIS-SUB] Listening to ch:crossing:*")
+
+        async for message in pubsub.listen():
+            if message["type"] == "pmessage":
+                local_recv = now_ms()
+                try:
+                    data = json.loads(message["data"])
+                    coin = data.get("coin", "?")
+                    tf = data.get("timeframe", "?")
+                    direction = data.get("direction", "?")
+
+                    prev_price = data.get("prev_price") or 0
+                    curr_price = data.get("current_price") or 0
+                    candle_open = data.get("candle_open") or 0
+
+                    binance_event_ms = data.get("binance_event_ms")
+                    server_recv_ms = data.get("server_recv_ms")
+
+                    # Latency 계산
+                    if binance_event_ms and server_recv_ms:
+                        binance_to_server = server_recv_ms - binance_event_ms
+                        server_to_here = local_recv - server_recv_ms
+                        total = local_recv - binance_event_ms
+                    else:
+                        binance_to_server = None
+                        server_to_here = None
+                        total = None
+
+                    # 콘솔 출력
+                    print(f"\n[CROSSING] {coin.upper()}/{tf} {direction.upper()}")
+                    print(f"  Price: {prev_price:.2f} → {curr_price:.2f} (open={candle_open:.2f})")
+                    if total:
+                        print(f"  Latency: Binance→Server {binance_to_server}ms, Server→Here {server_to_here}ms, TOTAL {total}ms")
+
+                    # 텔레그램 전송
+                    direction_emoji = "🔼" if direction == "up" else "🔽"
+                    tg_msg = (
+                        f"{direction_emoji} <b>{coin.upper()}/{tf} {direction.upper()}</b>\n"
+                        f"Price: {prev_price:.2f} → {curr_price:.2f}\n"
+                        f"Open: {candle_open:.2f}\n"
+                    )
+                    if total:
+                        tg_msg += f"Latency: {total}ms (B→S {binance_to_server}ms, S→H {server_to_here}ms)"
+
+                    asyncio.create_task(send_telegram(tg_msg))
+
+                except Exception as e:
+                    print(f"[CROSSING-SUB] Error: {e}")
+
     async def handle_direct_tick(self, coin: str, price: float, binance_event_ms: int, local_recv_ms: int):
         """Direct WS tick 처리"""
         direct_latency = local_recv_ms - binance_event_ms
@@ -215,11 +268,10 @@ class LatencyMonitor:
             print(f"\n[DIRECT] {coin.upper()} #{self.stats['direct_ws_count']} latency={direct_latency}ms")
 
     async def stats_loop(self):
-        """통계 출력 및 텔레그램 전송"""
+        """통계 출력 (콘솔만)"""
         await asyncio.sleep(30)  # 초기 30초 대기
 
         while True:
-            await asyncio.sleep(60)
             uptime = int(time.time() - self.start_time)
             redis_count = self.stats["redis_count"]
 
@@ -257,9 +309,10 @@ class LatencyMonitor:
                 print(f"  │ Direct WS (참고)    : avg={avg_direct:6.1f}ms  min={min_direct:4}ms  max={max_direct:4}ms │")
                 print(f"  └─────────────────────────────────────────────────────────────────────┘")
 
-                # 텔레그램은 60초마다 보내지 않음 (콘솔 출력만)
 
             print(f"{'#'*80}\n")
+
+            await asyncio.sleep(60)  # 다음 리포트까지 대기
 
     async def run(self):
         print("=" * 80)
@@ -292,7 +345,8 @@ class LatencyMonitor:
 
         tasks = [
             self.start_direct_binance_ws(),
-            self.subscribe_redis(),
+            self.subscribe_redis_candle(),
+            self.subscribe_redis_crossing(),
             self.stats_loop(),
         ]
 

@@ -19,7 +19,7 @@ COINS = ["btc"]
 TIMEFRAMES = ["5m"]
 
 # === Crossing 전략 파라미터 ===
-CROSSING_BET_CONTRACT_UNIT = 3       # 기본 단위: 1회차=3, 2~4회차=6, 5회차=3
+CROSSING_BET_CONTRACT_UNIT = 10      # 기본 단위: 1회차=10, 2~4회차=20, 5회차=10
 CROSSING_MAX_COUNT = 5               # 최대 진입 횟수
 COOLTIME_SECONDS = 1.0               # 거래 후 cooltime (1초)
 
