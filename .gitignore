@@ -41,6 +41,10 @@ exports/
 # Tick data (large CSV files)
 binance-tick-data/
 
+# Backtest data (large files)
+backtest_data/
+backtest_1y/
+
 # Environment
 .env.local
 .env.*.local
