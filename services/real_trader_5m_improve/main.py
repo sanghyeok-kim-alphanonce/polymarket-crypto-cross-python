@@ -613,6 +613,13 @@ class RealTrader5MCrossFrontService(AsyncServiceBase):
         elapsed_seconds = crossing_info.get('elapsed_seconds', 60) if crossing_info else 60
         gtc_price = GTC_FIXED_PRICE  # 고정 0.80
 
+        # 주문 시작 전에 cooltime 걸기 (동시 주문 방지)
+        if candle_key:
+            strategy = self.strategies.get(coin)
+            if strategy:
+                strategy.start_cooltime(candle_key, signal.side)
+                logger.info(f"[{coin}] COOLTIME started (pre-order): {signal.side} for {COOLTIME_SECONDS}s")
+
         await asyncio.sleep(0.005)
         orderbook = self.get_orderbook(coin, timeframe, signal.side)
         best_ask_pre = orderbook.get('best_ask', 0) if orderbook else 0
@@ -691,16 +698,11 @@ class RealTrader5MCrossFrontService(AsyncServiceBase):
                 f"filled={filled} @{fill_price:.3f} | latency={latency_ms:.0f}ms"
             )
 
-            # cooltime 시작 + 타이머로 pending 체크
+            # cooltime 타이머 시작 (cooltime은 pre-order에서 이미 시작됨)
             if candle_key:
-                strategy = self.strategies.get(coin)
-                if strategy:
-                    strategy.start_cooltime(candle_key, signal.side)
-                    logger.info(f"[{coin}] COOLTIME started: {signal.side} for {COOLTIME_SECONDS}s")
-                    # cooltime 후 pending 체크 타이머
-                    asyncio.create_task(self._cooltime_timer(
-                        coin, timeframe, candle_key, candle_start, candle_end
-                    ))
+                asyncio.create_task(self._cooltime_timer(
+                    coin, timeframe, candle_key, candle_start, candle_end
+                ))
 
             status_mark = "OK" if filled >= target else "PARTIAL"
             entry_label = f"#{entry_num}" if entry_num else ""
