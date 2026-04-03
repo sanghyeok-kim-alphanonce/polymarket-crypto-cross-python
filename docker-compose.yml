@@ -187,91 +187,6 @@ services:
       start_period: 15s
 
   # ============================================================================
-  # ============================================================================
-  # P4-Cross-V2: Paper Trader - Crossing V2 Strategy (무제한)
-  # - Redis subscribe: ch:crossing:*, ch:orderbook:*
-  # - 15분봉 시작가 crossing 시 방향 베팅
-  # - V2: 횟수 제한 없음, 14분까지 베팅
-  # ============================================================================
-  paper_trader_cross_v2:
-    build:
-      context: .
-      dockerfile: services/paper_trader_cross_v2/Dockerfile
-    container_name: cointest-paper-trader-cross-v2
-    depends_on:
-      paper_trade_db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      rtds:
-        condition: service_started
-      binance_ws:
-        condition: service_started
-    environment:
-      PYTHONUNBUFFERED: "1"
-      # 인프라 (컨테이너 네트워크)
-      DB_HOST: paper_trade_db
-      DB_PORT: 5432
-      DB_NAME: paper_trade
-      DB_USER: paper
-      DB_PASSWORD: papertrade
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      # 전략 파라미터는 config.py 기본값 사용
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "test -f /tmp/healthy"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-      start_period: 15s
-
-  # ============================================================================
-  # real_crossing_v2: 13분30초~14분30초 첫 Crossing 전략
-  # - BTC only, GTC 주문, 동적 가격
-  # - 텔레그램 알림
-  # ============================================================================
-  real_crossing_v2:
-    build:
-      context: .
-      dockerfile: services/real_trader_cross/Dockerfile
-    container_name: cointest-real-crossing-v2
-    depends_on:
-      paper_trade_db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      rtds:
-        condition: service_started
-      binance_ws:
-        condition: service_started
-    environment:
-      PYTHONUNBUFFERED: "1"
-      # 인프라 (컨테이너 네트워크)
-      DB_HOST: paper_trade_db
-      DB_PORT: 5432
-      DB_NAME: paper_trade
-      DB_USER: paper
-      DB_PASSWORD: papertrade
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      # Credentials (.env에서 가져옴)
-      POLYMARKET_PRIVATE_KEY: ${POLYMARKET_PRIVATE_KEY:-}
-      POLYMARKET_PROXY_ADDRESS: ${POLYMARKET_PROXY_ADDRESS:-}
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
-      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
-      # 전략 파라미터는 config.py 기본값 사용
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "test -f /tmp/healthy"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-      start_period: 15s
-    profiles:
-      - real  # 기본 실행 안함, docker compose --profile real up 으로 실행
-
-  # ============================================================================
   # real_trader_cross_limit_hedge: Crossing 전략 (횟수 제한 + 헤지)
   # - BTC only, 15분봉 전체 진입
   # - 1회차: 4 contracts, 2~9회차: 8 contracts, 10회차: 4 contracts
@@ -542,6 +457,80 @@ services:
       start_period: 15s
     profiles:
       - real  # docker compose --profile real up 으로 실행
+
+  # ============================================================================
+  # Paper Trader 15M Late: STRATEGY.md 15분봉 후반(11분~) 전략
+  # - 진입: 660초(11분) ~ 880초(14분40초)
+  # - 헤지: 880초 ~ 890초 (14분50초)
+  # - Max5 + 속도필터(20초/3회)
+  # ============================================================================
+  paper_trader_15m_late:
+    build:
+      context: .
+      dockerfile: services/paper_trader_15m_late/Dockerfile
+    container_name: cointest-paper-trader-15m-late
+    depends_on:
+      paper_trade_db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rtds:
+        condition: service_started
+      binance_ws:
+        condition: service_started
+    environment:
+      PYTHONUNBUFFERED: "1"
+      DB_HOST: paper_trade_db
+      DB_PORT: 5432
+      DB_NAME: paper_trade
+      DB_USER: paper
+      DB_PASSWORD: papertrade
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/healthy"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+
+  # ============================================================================
+  # Paper Trader 1H Late: STRATEGY.md 1시간봉 후반(56분~) 전략
+  # - 진입: 3360초(56분) ~ 3590초(59분50초)
+  # - 헤지: 3590초 ~ 3600초
+  # - Max5 + 속도필터(20초/3회)
+  # ============================================================================
+  paper_trader_1h_late:
+    build:
+      context: .
+      dockerfile: services/paper_trader_1h_late/Dockerfile
+    container_name: cointest-paper-trader-1h-late
+    depends_on:
+      paper_trade_db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rtds:
+        condition: service_started
+      binance_ws:
+        condition: service_started
+    environment:
+      PYTHONUNBUFFERED: "1"
+      DB_HOST: paper_trade_db
+      DB_PORT: 5432
+      DB_NAME: paper_trade
+      DB_USER: paper
+      DB_PASSWORD: papertrade
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/healthy"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
 
   # ============================================================================
   # Latency Monitor: Redis pub/sub 지연 시간 측정

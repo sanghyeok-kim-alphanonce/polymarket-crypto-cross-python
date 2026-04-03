@@ -12,7 +12,7 @@ ORDERBOOK_COINS = ['btc']
 PRICE_COINS = ['btc', 'eth', 'sol', 'xrp']
 # 하위 호환용 (deprecated)
 COINS = ORDERBOOK_COINS
-TIMEFRAMES = ['5m', '15m']
+TIMEFRAMES = ['5m', '15m', '1h']
 
 # === DB 설정 ===
 DB_HOST = os.getenv("DB_HOST", "paper_trade_db")

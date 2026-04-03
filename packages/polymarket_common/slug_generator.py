@@ -90,11 +90,12 @@ def generate_slug(coin: Coin, timeframe: Timeframe, timestamp: int | None = None
     if timestamp is None:
         timestamp = get_current_candle_timestamp(timeframe)
 
-    # 1시간봉은 다른 패턴 사용
+    # 1시간봉은 다른 패턴 사용: bitcoin-up-or-down-march-26-2026-2am-et
     if timeframe == "1h":
         dt_et = datetime.fromtimestamp(timestamp, tz=ET)
         month = dt_et.strftime("%B").lower()
         day = dt_et.day
+        year = dt_et.year
         hour = dt_et.hour
         ampm = "am" if hour < 12 else "pm"
         hour_12 = hour if hour <= 12 else hour - 12
@@ -102,7 +103,7 @@ def generate_slug(coin: Coin, timeframe: Timeframe, timestamp: int | None = None
             hour_12 = 12
 
         coin_name = COIN_1H_NAMES[coin]
-        return f"{coin_name}-up-or-down-{month}-{day}-{hour_12}{ampm}-et"
+        return f"{coin_name}-up-or-down-{month}-{day}-{year}-{hour_12}{ampm}-et"
 
     # 15분봉, 4시간봉은 기존 패턴
     return f"{coin}-updown-{timeframe}-{timestamp}"
