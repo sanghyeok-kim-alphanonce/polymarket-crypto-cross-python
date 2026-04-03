@@ -293,9 +293,6 @@ export default function RealTradingPage() {
             {selectedStrategy === 'real_crossing_5m' && (
               <>5분봉 시작가(open) crossing 시 방향 베팅 + 밸런싱. 최대 10회, 4분 전까지.</>
             )}
-            {selectedStrategy === 'real_crossing_v2' && (
-              <>Crossing Strategy V2 - 개선된 밸런싱 로직.</>
-            )}
             {selectedStrategy === 'real_trade_cross_14m_10limit' && (
               <>0-14분 crossing 전략. 10회 제한, 10회차 밸런싱(손실 최소화).</>
             )}
@@ -305,7 +302,7 @@ export default function RealTradingPage() {
             {selectedStrategy === 'real_trade_5m_cross_front' && (
               <>5분봉 0~3분 초반 crossing 전략. 10회 제한, GTC @0.80.</>
             )}
-            {selectedStrategy && !['real_crossing', 'real_crossing_5m', 'real_crossing_v2', 'real_trade_cross_14m_10limit', 'real_trade_cross_limit_hedge', 'real_trade_5m_cross_front'].includes(selectedStrategy) && (
+            {selectedStrategy && !['real_crossing', 'real_crossing_5m', 'real_trade_cross_14m_10limit', 'real_trade_cross_limit_hedge', 'real_trade_5m_cross_front'].includes(selectedStrategy) && (
               <>과거 전략 데이터</>
             )}
           </div>

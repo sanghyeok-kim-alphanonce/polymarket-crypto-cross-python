@@ -64,7 +64,6 @@ const STRATEGIES = [
   { value: 'v12_5', label: 'V12-5 (Delta)' },
   { value: 'v12_6', label: 'V12-6 (Momentum)' },
   { value: 'crossing', label: 'Crossing (5x limit)' },
-  { value: 'crossing_v2', label: 'Crossing V2 (unlimited)' },
 ];
 
 function formatTime(iso: string) {
@@ -82,7 +81,7 @@ function formatDateTime(iso: string) {
 
 export default function BacktestPage() {
   const [coin, setCoin] = useState('btc');
-  const [strategy, setStrategy] = useState('crossing_v2');
+  const [strategy, setStrategy] = useState('crossing');
   const [limit, setLimit] = useState(20);
   const [candles, setCandles] = useState<CandleEntry[]>([]);
   const [loadingCandles, setLoadingCandles] = useState(false);

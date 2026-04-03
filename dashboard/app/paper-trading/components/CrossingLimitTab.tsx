@@ -62,7 +62,7 @@ interface CrossingData {
 
 interface Props {
   strategyName: string;
-  timeframe: '5m' | '15m';
+  timeframe: '5m' | '15m' | '1h';
   candleMinutes: number;
   maxCount: number;
 }

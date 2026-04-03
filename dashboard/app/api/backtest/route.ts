@@ -3,7 +3,7 @@ import { NextResponse } from 'next/server';
 export const dynamic = 'force-dynamic';
 
 const BACKTEST_API = process.env.BACKTEST_API_URL || 'http://localhost:3842';
-const VALID_STRATEGIES = ['v12_5', 'v12_6', 'crossing', 'crossing_v2'];
+const VALID_STRATEGIES = ['v12_5', 'v12_6', 'crossing'];
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
