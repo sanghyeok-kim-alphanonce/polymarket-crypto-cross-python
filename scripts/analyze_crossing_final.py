@@ -1,25 +1,24 @@
 import pandas as pd
 import numpy as np
 
-df = pd.read_csv('/home/yeonwoo/poly-test/5m_crossing_count_v2.csv')
+df = pd.read_csv('/home/yeonwoo/poly-test/5m_crossing_count.csv')
 df['candle_start'] = pd.to_datetime(df['candle_start'])
 
 print(f"총 행: {len(df)}")
-print(f"코인: {df['coin'].unique()}")
 print()
 
 # 전체 분포
 print("=" * 60)
-print("전체 분포")
+print("전체 분포 (실제 데이터 기반)")
 print("=" * 60)
 total = len(df)
 for val in range(15):
     cnt = (df['crossing_count'] == val).sum()
     pct = cnt / total * 100
-    bar = '█' * int(pct/2)
+    bar = '█' * int(pct)
     print(f"  {val:2d}: {pct:5.1f}% ({cnt:5d}) {bar}")
 
-print(f"\n  0인 캔들: {(df['crossing_count'] == 0).sum()} / {len(df)}")
+print(f"\n  <5: {(df['crossing_count'] < 5).mean()*100:.1f}%")
 
 # 3개 캔들 연속 데이터
 results = []
@@ -51,10 +50,10 @@ print(f"\n연속 캔들 샘플: {len(rdf)}")
 
 # 조건별 개별 확률
 print()
-print("=" * 80)
-print("조건별 curr=0,1,2,3,4 개별 확률 (0 포함)")
-print("=" * 80)
-print(f"{'조건':<35} {'0':>6} {'1':>6} {'2':>6} {'3':>6} {'4':>6} {'<5':>7} {'n':>6}")
+print("=" * 85)
+print("조건별 curr=0,1,2,3,4 개별 확률")
+print("=" * 85)
+print(f"{'조건':<30} {'0':>6} {'1':>6} {'2':>6} {'3':>6} {'4':>6} {'<5':>7} {'n':>6}")
 print("-" * 85)
 
 conditions = [
@@ -69,8 +68,8 @@ conditions = [
     ("3개 모두 <=2", (rdf['prev3'] <= 2) & (rdf['prev2'] <= 2) & (rdf['prev1'] <= 2)),
     ("prev1 == 0", rdf['prev1'] == 0),
     ("prev1 <= 1", rdf['prev1'] <= 1),
-    ("hour==21", rdf['hour'] == 21),
     ("hour==21 & sum3<=6", (rdf['hour'] == 21) & (rdf['sum3'] <= 6)),
+    ("hour==21 & sum3<=9", (rdf['hour'] == 21) & (rdf['sum3'] <= 9)),
 ]
 
 for name, mask in conditions:
@@ -80,5 +79,5 @@ for name, mask in conditions:
         continue
     probs = [(subset['curr'] == v).sum() / n * 100 for v in range(5)]
     under5 = (subset['curr'] < 5).sum() / n * 100
-    print(f"{name:<35} {probs[0]:5.1f}% {probs[1]:5.1f}% {probs[2]:5.1f}% {probs[3]:5.1f}% {probs[4]:5.1f}% {under5:6.1f}% {n:6d}")
+    print(f"{name:<30} {probs[0]:5.1f}% {probs[1]:5.1f}% {probs[2]:5.1f}% {probs[3]:5.1f}% {probs[4]:5.1f}% {under5:6.1f}% {n:6d}")
 
