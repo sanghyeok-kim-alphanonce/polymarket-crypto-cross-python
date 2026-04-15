@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>real_trader_cross_limit_hedge — State Machine</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 1200px; margin: 24px auto; padding: 0 20px; background: #fafafa; color: #222; }
+  h1 { border-bottom: 2px solid #333; padding-bottom: 8px; }
+  h2 { margin-top: 40px; color: #1a5490; }
+  .diagram { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin: 16px 0; overflow-x: auto; }
+  .note { background: #fff4e0; padding: 12px 16px; border-left: 4px solid #f5a623; border-radius: 4px; margin: 12px 0; font-size: 14px; }
+  code { background: #eef; padding: 2px 6px; border-radius: 3px; font-size: 13px; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'default', flowchart: { curve: 'basis' } });
+</script>
+</head>
+<body>
+
+<h1>real_trader_cross_limit_hedge — State Machine 시각화</h1>
+
+<div class="note">
+<strong>전략 요약:</strong> 15분봉 시작가 crossing 기반, 캔들당 최대 10회 진입.
+1회차 <code>UNIT(10)</code>, 2~9회차 <code>2*UNIT(20)</code>, 10회차 <code>UNIT(10)</code>. GTC 고정가 0.70. BTC only.
+</div>
+
+<h2>1. Candle State Machine</h2>
+<p>캔들(15분)마다 생성되는 per-candle 상태 — <code>CrossingStrategy5M.candle_state</code></p>
+
+<div class="diagram">
+<pre class="mermaid">
+stateDiagram-v2
+    [*] --> IDLE: candle_boundary (reset)
+
+    IDLE --> IDLE: crossing @ elapsed&lt;150s (MIN 이전 무시)
+    IDLE --> IDLE: crossing @ elapsed≥900s (CUTOFF 이후 무시)
+    IDLE --> ACTIVE_1: crossing @ 150s≤elapsed&lt;870s, count=1, bet UNIT(10)
+    IDLE --> FINAL: crossing @ 870s≤elapsed&lt;900s, count=10, bet UNIT(10)
+
+    ACTIVE_1 --> ACTIVE_MID: crossing, count=2, bet 2*UNIT(20)
+    ACTIVE_MID --> ACTIVE_MID: crossing, count=3..9, bet 2*UNIT(20)
+    ACTIVE_MID --> FINAL: crossing & (count=10 OR elapsed≥870s), bet UNIT(10)
+    ACTIVE_1 --> FINAL: crossing @ elapsed≥870s, bet UNIT(10)
+
+    ACTIVE_1 --> FAILED: order rejection (mark_candle_failed)
+    ACTIVE_MID --> FAILED: order rejection
+    FINAL --> [*]: further crossings ignored (count≥MAX)
+    FAILED --> [*]: further crossings ignored
+</pre>
+</div>
+
+<div class="note">
+<strong>상수:</strong>
+<code>CROSSING_MIN_ELAPSED=150s</code> ·
+<code>CROSSING_CUTOFF=900s</code> ·
+<code>CROSSING_LATE_ENTRY=870s</code> ·
+<code>CROSSING_MAX_COUNT=10</code>
+</div>
+
+<h2>2. Trade Status Machine</h2>
+<p>개별 주문 1건의 라이프사이클 — <code>test_paper_trades.status</code></p>
+
+<div class="diagram">
+<pre class="mermaid">
+stateDiagram-v2
+    [*] --> PENDING: post_order success & filled=0 (maker 대기)
+    [*] --> FILLED: post_order success & takingAmount&gt;0 (즉시 체결)
+    [*] --> FAILED: post_order rejected / exception
+
+    PENDING --> FILLED: _check_pending_orders, size_matched&gt;0
+    PENDING --> EXPIRED: _check_pending_orders, size_matched=0 (candle_end+10s)
+    PENDING --> EXPIRED: get_order 조회 실패
+
+    FILLED --> CLOSED_WIN: settle_trades, side == market_result
+    FILLED --> CLOSED_LOSS: settle_trades, side != market_result
+    FILLED --> CLOSED_FLAT: settle_trades, market_result=FLAT
+    FAILED --> CLOSED_FAILED: settle_trades (pnl=0)
+
+    EXPIRED --> [*]
+    CLOSED_WIN --> [*]
+    CLOSED_LOSS --> [*]
+    CLOSED_FLAT --> [*]
+    CLOSED_FAILED --> [*]
+</pre>
+</div>
+
+<h2>3. Service-level Event Flow</h2>
+<p>Redis 이벤트 → 전략 판정 → 주문 실행 → 정산</p>
+
+<div class="diagram">
+<pre class="mermaid">
+flowchart TD
+    A[Redis ch:candle_boundary:15m] -->|reset| B[candle_state clear<br/>ob_cache clear]
+    C[Redis ch:orderbook:*] -->|cache| D[ob_cache +<br/>token_info prefetch]
+    E[Redis ch:crossing:*] --> F{should_enter_on_crossing}
+    F -->|None| G[skip]
+    F -->|TradeSignal| H[execute_order]
+    D -.orderbook lookup.-> H
+    H --> I[_place_gtc_order<br/>GTC @ 0.70]
+    I --> J[_record_trade<br/>INSERT test_paper_trades]
+    J --> K[Telegram notify]
+
+    L[settlement_loop<br/>60s poll] --> M[_check_pending_orders<br/>PENDING → FILLED/EXPIRED]
+    L --> N[settle_trades<br/>FILLED/FAILED → CLOSED]
+    N --> O[Telegram summary<br/>W/L/PnL]
+
+    style F fill:#ffe9b3
+    style H fill:#d4edda
+    style I fill:#d4edda
+    style L fill:#e2d4f0
+    style N fill:#e2d4f0
+</pre>
+</div>
+
+<h2>4. 베팅 수량 결정 로직</h2>
+
+<div class="diagram">
+<pre class="mermaid">
+flowchart LR
+    X[crossing event] --> Y{failed OR count≥10?}
+    Y -->|Yes| Z1[skip]
+    Y -->|No| A1{elapsed &lt; 150s?}
+    A1 -->|Yes| Z1
+    A1 -->|No| A2{elapsed ≥ 900s?}
+    A2 -->|Yes| Z1
+    A2 -->|No| B1[count++]
+    B1 --> C1{count=10 OR<br/>elapsed ≥ 870s?}
+    C1 -->|Yes| D1[FINAL: bet UNIT<br/>count=10 고정]
+    C1 -->|No| C2{count=1?}
+    C2 -->|Yes| D2[bet UNIT = 10]
+    C2 -->|No| D3[bet 2*UNIT = 20]
+
+    style D1 fill:#ffd6cc
+    style D2 fill:#d4edda
+    style D3 fill:#cce5ff
+</pre>
+</div>
+
+</body>
+</html>
