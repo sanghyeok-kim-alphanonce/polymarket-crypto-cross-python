@@ -21,7 +21,7 @@ COINS = ["btc"]
 TIMEFRAMES = ["5m"]
 
 # === Crossing 전략 파라미터 ===
-CROSSING_BET_CONTRACT_UNIT = 10      # 기본 단위: 1회차=10, 2회차=20, 3회차(hedge)=10
+CROSSING_BET_CONTRACT_UNIT = 15      # 기본 단위: 1회차=15, 2회차=30, 3회차(hedge)=15 (1.5x scale of 10/20/10 design)
 CROSSING_MAX_COUNT = 3               # 최대 진입 횟수 (3번째는 hedge)
 COOLTIME_SECONDS = 1.0               # 거래 후 cooltime (1초)
 

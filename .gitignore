@@ -48,3 +48,5 @@ backtest_1y/
 # Environment
 .env.local
 .env.*.local
+
+trade_archive/
