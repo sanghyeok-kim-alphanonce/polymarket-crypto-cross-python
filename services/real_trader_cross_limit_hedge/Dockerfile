@@ -6,7 +6,7 @@ RUN pip install --no-cache-dir \
     asyncpg \
     redis \
     aiohttp \
-    py-clob-client
+    py-clob-client-v2
 
 COPY packages/polymarket_common /app/packages/polymarket_common
 COPY packages/service_common /app/packages/service_common

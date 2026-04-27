@@ -32,10 +32,14 @@ def get_gtc_price(elapsed_seconds: int) -> float:
     return GTC_FIXED_PRICE
 
 # === Polymarket CLOB 설정 ===
+# 2026-04-28 ~11:00 UTC cutover로 V1→V2 전환 (같은 URL이 V2 backend로 교체).
+# 4/28 이전에 V2 미리 검증하려면 POLYMARKET_HOST=https://clob-v2.polymarket.com.
 POLYMARKET_HOST = os.getenv("POLYMARKET_HOST", "https://clob.polymarket.com")
 POLYMARKET_CHAIN_ID = int(os.getenv("POLYMARKET_CHAIN_ID", "137"))
 POLYMARKET_PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "")
 POLYMARKET_PROXY_ADDRESS = os.getenv("POLYMARKET_PROXY_ADDRESS", "")
+# Builder 프로그램 등록한 경우만. 미설정 시 attribution 없이 거래.
+POLYMARKET_BUILDER_CODE = os.getenv("POLYMARKET_BUILDER_CODE", "")
 
 # === Telegram 설정 ===
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")

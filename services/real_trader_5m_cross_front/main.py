@@ -29,6 +29,7 @@ from config import (
     get_gtc_price,
     POLYMARKET_HOST, POLYMARKET_CHAIN_ID,
     POLYMARKET_PRIVATE_KEY, POLYMARKET_PROXY_ADDRESS,
+    POLYMARKET_BUILDER_CODE,
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_THREAD_ID,
     DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD,
     REDIS_HOST, REDIS_PORT,
@@ -178,7 +179,11 @@ class RealTrader5MCrossFrontService(AsyncServiceBase):
             return
 
         try:
-            from py_clob_client.client import ClobClient
+            from py_clob_client_v2 import ClobClient, BuilderConfig, BalanceAllowanceParams, AssetType
+
+            builder_config = None
+            if POLYMARKET_BUILDER_CODE:
+                builder_config = BuilderConfig(builder_code=POLYMARKET_BUILDER_CODE)
 
             self.clob_client = ClobClient(
                 host=POLYMARKET_HOST,
@@ -186,16 +191,28 @@ class RealTrader5MCrossFrontService(AsyncServiceBase):
                 chain_id=POLYMARKET_CHAIN_ID,
                 signature_type=2,
                 funder=POLYMARKET_PROXY_ADDRESS,
+                builder_config=builder_config,
             )
 
-            api_creds = self.clob_client.create_or_derive_api_creds()
+            api_creds = self.clob_client.create_or_derive_api_key()
             self.clob_client.set_api_creds(api_creds)
 
+            # V2: 첫 주문이 stale balance/allowance cache로 reject되지 않도록 강제 refresh.
+            try:
+                self.clob_client.update_balance_allowance(
+                    BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                )
+            except Exception as e:
+                logger.warning(f"update_balance_allowance failed (non-fatal): {e}")
+
             self._clob_initialized = True
-            logger.info(f"CLOB client initialized (host={POLYMARKET_HOST}, chain={POLYMARKET_CHAIN_ID})")
+            logger.info(
+                f"CLOB v2 client initialized (host={POLYMARKET_HOST}, chain={POLYMARKET_CHAIN_ID}, "
+                f"builder_code={'set' if POLYMARKET_BUILDER_CODE else 'none'})"
+            )
 
         except ImportError:
-            logger.error("py-clob-client not installed, live trading disabled")
+            logger.error("py-clob-client-v2 not installed, live trading disabled")
         except Exception as e:
             logger.error(f"Failed to initialize CLOB client: {e}")
 
@@ -324,13 +341,11 @@ class RealTrader5MCrossFrontService(AsyncServiceBase):
         try:
             tick_size = self.clob_client.get_tick_size(token_id)
             neg_risk = self.clob_client.get_neg_risk(token_id)
-            fee_rate = self.clob_client.get_fee_rate_bps(token_id)
             self.token_info_cache[token_id] = {
                 "tick_size": tick_size,
                 "neg_risk": neg_risk,
-                "fee_rate": fee_rate,
             }
-            logger.info(f"[PREFETCH] Cached: {token_id[:16]}... tick={tick_size} neg_risk={neg_risk} fee={fee_rate}bps")
+            logger.info(f"[PREFETCH] Cached: {token_id[:16]}... tick={tick_size} neg_risk={neg_risk}")
         except Exception as e:
             logger.warning(f"[PREFETCH] Failed to cache token info: {e}")
 
@@ -569,39 +584,32 @@ class RealTrader5MCrossFrontService(AsyncServiceBase):
         target_contracts: int,
         gtc_price: float,
     ) -> Dict[str, Any]:
-        from py_clob_client.clob_types import OrderArgs, OrderType
-        from py_clob_client.order_builder.constants import BUY
+        # V2: book을 크로스하는 GTC는 strict reject(400). 본 전략은 GTC=0.80 고정으로
+        # 항상 시세 위 가격을 발사 → 의도가 taker이므로 FAK(IOC) 사용.
+        from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions, Side
 
         start_time = time.time()
         order_price = gtc_price
 
         try:
             cached = self.token_info_cache.get(token_id)
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=order_price,
+                size=float(target_contracts),
+                side=Side.BUY,
+            )
             if cached:
-                from py_clob_client.clob_types import PartialCreateOrderOptions
-                order_args = OrderArgs(
-                    token_id=token_id,
-                    price=order_price,
-                    size=float(target_contracts),
-                    side=BUY,
-                    fee_rate_bps=cached["fee_rate"],
-                )
                 options = PartialCreateOrderOptions(
                     tick_size=cached["tick_size"],
                     neg_risk=cached["neg_risk"],
                 )
                 signed_order = self.clob_client.create_order(order_args, options)
             else:
-                order_args = OrderArgs(
-                    token_id=token_id,
-                    price=order_price,
-                    size=float(target_contracts),
-                    side=BUY,
-                )
                 signed_order = self.clob_client.create_order(order_args)
 
-            response = self.clob_client.post_order(signed_order, OrderType.GTC)
-            logger.info(f"[GTC] CLOB response (price={order_price}, size={target_contracts}): {response}")
+            response = self.clob_client.post_order(signed_order, OrderType.FAK)
+            logger.info(f"[FAK] CLOB response (price={order_price}, size={target_contracts}): {response}")
 
             if isinstance(response, dict):
                 order_id = response.get("orderID") or response.get("orderId", "")
@@ -667,7 +675,7 @@ class RealTrader5MCrossFrontService(AsyncServiceBase):
         except Exception as e:
             error_msg = str(e)
             total_latency = (time.time() - start_time) * 1000
-            logger.error(f"[GTC] Exception: {error_msg}")
+            logger.error(f"[FAK] Exception: {error_msg}")
 
             return {
                 "success": False,

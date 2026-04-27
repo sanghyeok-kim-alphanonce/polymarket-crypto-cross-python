@@ -9,8 +9,9 @@ dependencies = [
     "aiohttp>=3.9.0",
     "httpx>=0.27.0",
     "python-dotenv>=1.0.0",
-    "py-clob-client>=0.1.0",
-    # Claim dependencies
+    # Polymarket CLOB v2 SDK (V1 sunset on 2026-04-28)
+    "py-clob-client-v2>=1.0.0",
+    # Claim dependencies (Builder Relayer is independent of CLOB v1/v2)
     "web3>=6.0.0",
     "eth-abi>=4.0.0",
     "py-builder-relayer-client",

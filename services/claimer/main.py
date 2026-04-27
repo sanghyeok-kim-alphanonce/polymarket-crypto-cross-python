@@ -50,8 +50,7 @@ from typing import Dict, List, Optional, Set
 import httpx
 from web3 import Web3
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import BalanceAllowanceParams
+from py_clob_client_v2 import ClobClient, BalanceAllowanceParams, AssetType
 
 # Configure logging
 logging.basicConfig(
@@ -89,8 +88,16 @@ async def tg_send(text: str):
 # =============================================================================
 
 # Polygon Mainnet Contract Addresses
+# CTF (Conditional Tokens) 주소는 V1/V2 동일.
 CONDITIONAL_TOKENS_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+# Collateral 주소: V1 = USDC.e, V2 = pUSD (2026-04-28 cutover).
+# `redeemPositions(collateralToken, ...)` 의 collateralToken은 마켓 생성 시점의
+# collateral과 일치해야 함. cutover 이전 마켓은 USDC.e, 이후 마켓은 pUSD.
+USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+PUSD_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+# 기본값은 환경변수로 오버라이드 가능 (cutover 이후 새 마켓 redeem 시 PUSD로 변경).
+# 더 정교하게는 마켓별로 collateral을 조회해야 하지만, 단일 collateral 가정 유지.
+USDC_ADDRESS = os.environ.get("CLAIM_COLLATERAL_ADDRESS", USDC_E_ADDRESS)
 
 # Relayer URL (v2 for gasless transactions)
 RELAYER_URL = "https://relayer-v2.polymarket.com"
@@ -673,19 +680,22 @@ class AccountClaimer:
         self.rate_limit_until: float = 0
         self.consecutive_rate_limits: int = 0
 
-        # CLOB client for balance verification
+        # CLOB v2 client for balance verification
+        # 2026-04-28 cutover로 같은 URL이 V2 backend로 교체됨. 4/28 이전 검증은 clob-v2 URL 사용.
         self._clob_client: Optional[ClobClient] = None
         try:
+            host = os.environ.get("POLYMARKET_HOST", "https://clob.polymarket.com")
             client = ClobClient(
-                "https://clob.polymarket.com",
+                host=host,
                 key=config.private_key,
                 chain_id=137,
                 signature_type=2,
+                funder=config.proxy_address,
             )
-            creds = client.create_or_derive_api_creds()
+            creds = client.create_or_derive_api_key()
             client.set_api_creds(creds)
             self._clob_client = client
-            logger.info(f"[{config.name}] CLOB balance checker initialized")
+            logger.info(f"[{config.name}] CLOB v2 balance checker initialized")
         except Exception as e:
             logger.warning(f"[{config.name}] CLOB client init failed: {e}")
 
@@ -713,12 +723,17 @@ class AccountClaimer:
         )
 
     def _get_usdc_balance(self) -> Optional[float]:
-        """Get USDC.e balance via CLOB API. Returns None on failure."""
+        """Get collateral balance via CLOB v2 API. Returns None on failure.
+
+        V2: COLLATERAL is pUSD (post-cutover). Decimals (6) unchanged from USDC.e.
+        SDK auto-injects signature_type=2 from the builder so the server resolves
+        Safe balance instead of EOA (otherwise always 0 for sig_type=2 wallets).
+        """
         if not self._clob_client:
             return None
         try:
             result = self._clob_client.get_balance_allowance(
-                BalanceAllowanceParams(asset_type="COLLATERAL")
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
             )
             raw = int(result.get("balance", 0))
             return raw / 1e6

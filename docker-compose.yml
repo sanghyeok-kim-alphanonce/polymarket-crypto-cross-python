@@ -219,6 +219,10 @@ services:
       # Credentials (.env에서 가져옴)
       POLYMARKET_PRIVATE_KEY: ${POLYMARKET_PRIVATE_KEY:-}
       POLYMARKET_PROXY_ADDRESS: ${POLYMARKET_PROXY_ADDRESS:-}
+      # V2: Builder code (선택). Builder 프로그램 등록한 경우만.
+      POLYMARKET_BUILDER_CODE: ${POLYMARKET_BUILDER_CODE:-}
+      # V2 검증용 (선택, 4/28 이전): https://clob-v2.polymarket.com
+      POLYMARKET_HOST: ${POLYMARKET_HOST:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       TELEGRAM_THREAD_ID: ${TELEGRAM_THREAD_ID:-}
@@ -255,6 +259,11 @@ services:
       ACCOUNT_1_NAME: main
       # 설정
       CLAIM_INTERVAL: 3600
+      # V2: redeemPositions의 collateralToken 오버라이드 (선택).
+      # 기본값 USDC.e (V1, cutover 이전 마켓). cutover 이후 새 마켓은 pUSD 사용 필요.
+      CLAIM_COLLATERAL_ADDRESS: ${CLAIM_COLLATERAL_ADDRESS:-}
+      # V2 검증용 (선택, 4/28 이전): https://clob-v2.polymarket.com
+      POLYMARKET_HOST: ${POLYMARKET_HOST:-}
       # Telegram 알림
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
@@ -395,6 +404,10 @@ services:
       # Credentials (.env에서 가져옴)
       POLYMARKET_PRIVATE_KEY: ${POLYMARKET_PRIVATE_KEY:-}
       POLYMARKET_PROXY_ADDRESS: ${POLYMARKET_PROXY_ADDRESS:-}
+      # V2: Builder code (선택). Builder 프로그램 등록한 경우만.
+      POLYMARKET_BUILDER_CODE: ${POLYMARKET_BUILDER_CODE:-}
+      # V2 검증용 (선택, 4/28 이전): https://clob-v2.polymarket.com
+      POLYMARKET_HOST: ${POLYMARKET_HOST:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       TELEGRAM_THREAD_ID: ${TELEGRAM_THREAD_ID:-}
@@ -443,11 +456,13 @@ services:
       # Credentials (.env에서 가져옴)
       POLYMARKET_PRIVATE_KEY: ${POLYMARKET_PRIVATE_KEY:-}
       POLYMARKET_PROXY_ADDRESS: ${POLYMARKET_PROXY_ADDRESS:-}
+      # V2: Builder code (선택). Builder 프로그램 등록한 경우만.
+      POLYMARKET_BUILDER_CODE: ${POLYMARKET_BUILDER_CODE:-}
+      # V2 검증용 (선택, 4/28 이전): https://clob-v2.polymarket.com
+      POLYMARKET_HOST: ${POLYMARKET_HOST:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       TELEGRAM_THREAD_ID: ${TELEGRAM_THREAD_ID:-}
-      # HTTP timeout for CLOB API (default: 15 seconds)
-      CLOB_HTTP_TIMEOUT: "15"
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "test -f /tmp/healthy"]

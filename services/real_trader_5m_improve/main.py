@@ -15,9 +15,10 @@ import asyncio
 import json
 import time
 from collections import defaultdict, deque
-from datetime import datetime, timezone, timedelta
-from typing import Dict, Optional, Any
 from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Dict, Optional, Any
 
 import aiohttp
 
@@ -29,8 +30,11 @@ from config import (
     SPEED_FILTER_WINDOW_SECONDS, SPEED_FILTER_MAX_CROSSINGS,
     COOLTIME_SECONDS,
     GTC_FIXED_PRICE,
+    BOOK_DEPTH_REQUIRED, BOOK_DEPTH_SAFETY, BOOK_DEPTH_PENDING_ENABLED,
+    SIGNALS_LOG_PATH,
     POLYMARKET_HOST, POLYMARKET_CHAIN_ID,
     POLYMARKET_PRIVATE_KEY, POLYMARKET_PROXY_ADDRESS,
+    POLYMARKET_BUILDER_CODE,
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_THREAD_ID,
     DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD,
     REDIS_HOST, REDIS_PORT,
@@ -52,6 +56,29 @@ class TradeSignal:
     side: str
     reason: str
     contracts: int
+
+
+@dataclass
+class PendingBookSignal:
+    """A signal that was generated but couldn't fill due to insufficient book depth.
+    Re-evaluated on every orderbook update for the matching coin/tf/side until either:
+      - book recovers and we fire (book_depth_recovered_fire)
+      - elapsed >= CROSSING_HEDGE_CUTOFF_SECONDS (book_depth_expired)
+      - opposite-direction crossing arrives (book_depth_overridden)
+      - strategy state becomes invalid e.g. hedged=True (book_depth_drop_invalid_state)
+
+    Note: at fire time we re-call _create_trade_signal which re-computes contracts
+    based on CURRENT state. So if state evolved (other crossings fired), the entry
+    number / sizing adapts. The original `intended_contracts` field below is the
+    snapshot at arm time, used only for the depth recheck threshold.
+    """
+    direction: str               # "up" | "down"
+    side: str                    # "up" | "down" — same as direction
+    intended_contracts: int      # snapshot at arm time (used for depth threshold)
+    gtc_price: float
+    armed_at_elapsed_s: int
+    armed_at_ts: float
+    crossing_info: Dict          # original crossing_info for downstream order/log fields
 
 
 class CrossingStrategy5MFront:
@@ -85,6 +112,8 @@ class CrossingStrategy5MFront:
                 "pending_direction": None,
                 "pending_elapsed": None,  # pending 발생 시점의 elapsed
                 "pending_crossing_info": None,  # pending 발생 시 원본 crossing_info
+                # 책 깊이 부족으로 미체결된 시그널 (책 회복 tick에서 재시도)
+                "pending_book_signal": None,  # type: Optional[PendingBookSignal]
             }
         return self.candle_state[candle_key]
 
@@ -171,7 +200,12 @@ class CrossingStrategy5MFront:
         elapsed_seconds: int,
         candle_key: str,
     ) -> TradeSignal:
-        """TradeSignal 생성 + 상태 업데이트"""
+        """TradeSignal 생성 + 상태 업데이트.
+
+        주의: 이 메서드는 state["count"]++ 와 (헤지면) state["hedged"]=True 를
+        수행합니다. 호출 직후 책 깊이 가드에 막혀 발사를 못 하게 되면
+        rollback_last_signal() 로 되돌려야 합니다.
+        """
         state = self._get_candle_state(candle_key)
 
         side = "up" if direction == "up" else "down"
@@ -180,17 +214,17 @@ class CrossingStrategy5MFront:
         is_hedge = False
         hedge_reason = ""
 
-        # 3. 250초~290초 → 헤지 구간
+        # 3. ENTRY_CUTOFF~HEDGE_CUTOFF 구간 → 헤지 구간
         if elapsed_seconds >= CROSSING_ENTRY_CUTOFF_SECONDS:
             is_hedge = True
             hedge_reason = "HEDGE_TIME"
 
-        # 4. 4번 진입 후 5번째 → Max5 헤지
+        # 4. count >= MAX_COUNT - 1 → Max 헤지 (마지막 진입을 헤지로 종결)
         elif state["count"] >= CROSSING_MAX_COUNT - 1:
             is_hedge = True
-            hedge_reason = "HEDGE_MAX5"
+            hedge_reason = "HEDGE_MAX"
 
-        # 5. 20초 내 3회 이상 → 속도 필터 헤지
+        # 5. 20초 내 SPEED_FILTER_MAX_CROSSINGS 이상 → 속도 필터 헤지
         elif self._count_recent_crossings(state["crossing_times"], elapsed_seconds) >= SPEED_FILTER_MAX_CROSSINGS:
             is_hedge = True
             hedge_reason = "HEDGE_SPEED"
@@ -215,6 +249,43 @@ class CrossingStrategy5MFront:
             reason=reason,
             contracts=contracts,
         )
+
+    def rollback_last_signal(self, candle_key: str, was_hedge: bool) -> None:
+        """_create_trade_signal 의 mutation 을 되돌림.
+
+        책 깊이 가드에 막혀 시그널을 발사하지 못한 경우 호출. 다음 동일 시그널이
+        같은 entry_number 로 다시 평가될 수 있도록 count 와 hedged 를 복원.
+        """
+        state = self._get_candle_state(candle_key)
+        if state["count"] > 0:
+            state["count"] -= 1
+        if was_hedge:
+            state["hedged"] = False
+
+    def fire_pending_direct(
+        self,
+        direction: str,
+        elapsed_seconds: int,
+        candle_key: str,
+    ) -> Optional[TradeSignal]:
+        """책 회복 시 pending 시그널을 직접 재평가하여 발사 여부 결정.
+
+        process_crossing_event 의 cooltime / last_trade_direction 분기를 우회하지만
+        다음 안전장치는 강제:
+          - state["failed"] / state["hedged"] / count >= MAX_COUNT 면 None
+          - elapsed >= CROSSING_HEDGE_CUTOFF_SECONDS 면 None (시간 만료)
+        통과하면 _create_trade_signal 로 일반 시그널 생성 (count++, hedged 갱신).
+        """
+        state = self._get_candle_state(candle_key)
+
+        if state["failed"] or state["hedged"]:
+            return None
+        if state["count"] >= CROSSING_MAX_COUNT:
+            return None
+        if elapsed_seconds >= CROSSING_HEDGE_CUTOFF_SECONDS:
+            return None
+
+        return self._create_trade_signal(direction, elapsed_seconds, candle_key)
 
     def start_cooltime(self, candle_key: str, direction: str):
         """거래 후 cooltime 시작"""
@@ -302,6 +373,97 @@ class RealTrader5MCrossFrontService(AsyncServiceBase):
             coin: deque(maxlen=2) for coin in COINS
         }
 
+        # 책 깊이 가드 구조화 로그 파일 핸들
+        # asyncio 단일 루프 환경이라 별도 lock 불필요 (append-line 한 줄 단위)
+        self._signals_log_path: Optional[Path] = None
+        if SIGNALS_LOG_PATH:
+            try:
+                p = Path(SIGNALS_LOG_PATH)
+                p.parent.mkdir(parents=True, exist_ok=True)
+                self._signals_log_path = p
+            except Exception as e:
+                logger.warning(f"[BOOK_GUARD] Could not prepare SIGNALS_LOG_PATH={SIGNALS_LOG_PATH}: {e}")
+                self._signals_log_path = None
+
+    # =========================================================================
+    # 책 깊이 가드 헬퍼 (Polymarket FAK/GTC 매칭 보호)
+    # =========================================================================
+    @staticmethod
+    def _check_book_depth(
+        orderbook: Optional[Dict],
+        gtc_price: float,
+        intended_contracts: int,
+    ) -> Dict[str, Any]:
+        """진입 직전 top-of-book 충분성 검사.
+
+        통과 조건 (둘 다):
+          1. best_ask 가 존재 AND best_ask <= gtc_price (즉시 매칭 가능 가격대)
+          2. best_ask_size * BOOK_DEPTH_SAFETY >= intended_contracts (수량 흡수 가능)
+
+        반환 dict:
+          passed (bool), reason (str), best_ask, best_ask_size, available, required
+        """
+        if not orderbook:
+            return {
+                "passed": False, "reason": "no_orderbook",
+                "best_ask": None, "best_ask_size": 0,
+                "available": 0, "required": float(intended_contracts),
+            }
+        best_ask = orderbook.get("best_ask")
+        best_ask_size = float(orderbook.get("best_ask_size") or 0)
+        if best_ask is None:
+            return {
+                "passed": False, "reason": "no_best_ask",
+                "best_ask": None, "best_ask_size": best_ask_size,
+                "available": 0, "required": float(intended_contracts),
+            }
+        try:
+            best_ask_f = float(best_ask)
+        except (TypeError, ValueError):
+            return {
+                "passed": False, "reason": "bad_best_ask",
+                "best_ask": best_ask, "best_ask_size": best_ask_size,
+                "available": 0, "required": float(intended_contracts),
+            }
+        if best_ask_f > gtc_price:
+            return {
+                "passed": False, "reason": "ask_above_limit",
+                "best_ask": best_ask_f, "best_ask_size": best_ask_size,
+                "available": 0, "required": float(intended_contracts),
+            }
+        # safety 분모 0 방어 (실수 입력 막기)
+        safety = BOOK_DEPTH_SAFETY if BOOK_DEPTH_SAFETY > 0 else 1.0
+        required = float(intended_contracts) / safety
+        passed = best_ask_size >= required
+        return {
+            "passed": passed,
+            "reason": "depth_ok" if passed else "depth_short",
+            "best_ask": best_ask_f, "best_ask_size": best_ask_size,
+            "available": best_ask_size, "required": required,
+        }
+
+    def _log_signal(self, label: str, **fields) -> None:
+        """JSON-Lines 구조화 시그널 기록.
+
+        분석 스크립트가 추후 book_depth_skip / recovered_fire / expired / overridden
+        / drop_invalid_state / dup_ignored 비율을 집계할 때 사용.
+        파일 IO는 동기지만, append 한 줄 (~수백 바이트) 이라 latency 무시 가능.
+        """
+        record = {
+            "ts": time.time(),
+            "strategy": STRATEGY_NAME,
+            "label": label,
+            **fields,
+        }
+        # 항상 일반 로거에도 한 줄로 남김 (가시성)
+        logger.info(f"[SIGNAL] {label} {json.dumps(fields, default=str)}")
+        if self._signals_log_path is None:
+            return
+        try:
+            with open(self._signals_log_path, "a") as f:
+                f.write(json.dumps(record, default=str) + "\n")
+        except Exception as e:
+            logger.warning(f"[SIGNAL] write failed: {e}")
 
     def _init_clob_client(self):
         """Initialize Polymarket CLOB client"""
@@ -314,7 +476,11 @@ class RealTrader5MCrossFrontService(AsyncServiceBase):
             return
 
         try:
-            from py_clob_client.client import ClobClient
+            from py_clob_client_v2 import ClobClient, BuilderConfig, BalanceAllowanceParams, AssetType
+
+            builder_config = None
+            if POLYMARKET_BUILDER_CODE:
+                builder_config = BuilderConfig(builder_code=POLYMARKET_BUILDER_CODE)
 
             self.clob_client = ClobClient(
                 host=POLYMARKET_HOST,
@@ -322,16 +488,29 @@ class RealTrader5MCrossFrontService(AsyncServiceBase):
                 chain_id=POLYMARKET_CHAIN_ID,
                 signature_type=2,
                 funder=POLYMARKET_PROXY_ADDRESS,
+                builder_config=builder_config,
             )
 
-            api_creds = self.clob_client.create_or_derive_api_creds()
+            api_creds = self.clob_client.create_or_derive_api_key()
             self.clob_client.set_api_creds(api_creds)
 
+            # V2: 서버측 balance/allowance 인덱서 강제 refresh.
+            # 누락 시 onchain approve가 끝나도 첫 주문이 stale cache로 reject됨.
+            try:
+                self.clob_client.update_balance_allowance(
+                    BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                )
+            except Exception as e:
+                logger.warning(f"update_balance_allowance failed (non-fatal): {e}")
+
             self._clob_initialized = True
-            logger.info(f"CLOB client initialized (host={POLYMARKET_HOST}, chain={POLYMARKET_CHAIN_ID})")
+            logger.info(
+                f"CLOB v2 client initialized (host={POLYMARKET_HOST}, chain={POLYMARKET_CHAIN_ID}, "
+                f"builder_code={'set' if POLYMARKET_BUILDER_CODE else 'none'})"
+            )
 
         except ImportError:
-            logger.error("py-clob-client not installed, live trading disabled")
+            logger.error("py-clob-client-v2 not installed, live trading disabled")
         except Exception as e:
             logger.error(f"Failed to initialize CLOB client: {e}")
 
@@ -452,6 +631,11 @@ class RealTrader5MCrossFrontService(AsyncServiceBase):
             logger.info("[P1] Connection restored")
             self.p1_disconnect_warned = False
 
+        # === 책 깊이 pending 회복 시도 ===
+        # 이 coin/tf/side 에 미처리 pending 이 있고 책이 충분해졌으면 발사.
+        if BOOK_DEPTH_REQUIRED and BOOK_DEPTH_PENDING_ENABLED:
+            await self._try_book_recovery(coin, tf, side, token_id)
+
     async def _prefetch_token_info(self, token_id: str):
         if not self.is_live_enabled:
             return
@@ -460,15 +644,133 @@ class RealTrader5MCrossFrontService(AsyncServiceBase):
         try:
             tick_size = self.clob_client.get_tick_size(token_id)
             neg_risk = self.clob_client.get_neg_risk(token_id)
-            fee_rate = self.clob_client.get_fee_rate_bps(token_id)
             self.token_info_cache[token_id] = {
                 "tick_size": tick_size,
                 "neg_risk": neg_risk,
-                "fee_rate": fee_rate,
             }
-            logger.info(f"[PREFETCH] Cached: {token_id[:16]}... tick={tick_size} neg_risk={neg_risk} fee={fee_rate}bps")
+            logger.info(f"[PREFETCH] Cached: {token_id[:16]}... tick={tick_size} neg_risk={neg_risk}")
         except Exception as e:
             logger.warning(f"[PREFETCH] Failed to cache token info: {e}")
+
+    async def _try_book_recovery(self, coin: str, timeframe: str, side: str, token_id: str) -> None:
+        """책 업데이트 tick 마다 호출 — 매칭되는 pending 이 있으면 재평가 후 발사.
+
+        호출 빈도가 높으므로 빠른 경로 (no pending → 즉시 return) 가 핵심.
+        """
+        strategy = self.strategies.get(coin)
+        if strategy is None:
+            return
+
+        # 5분봉 BTC 단일 코인이라 활성 candle_state 는 0~1개.
+        # 그래도 일반화: 해당 coin/tf 에 매칭되는 candle_key 한 개를 찾는다.
+        target_key = None
+        target_pending: Optional[PendingBookSignal] = None
+        prefix = f"{coin}_{timeframe}_"
+        for ck, st in strategy.candle_state.items():
+            if not ck.startswith(prefix):
+                continue
+            pending = st.get("pending_book_signal")
+            if pending is None or pending.side != side:
+                continue
+            target_key = ck
+            target_pending = pending
+            break
+
+        if target_pending is None:
+            return
+
+        state = strategy._get_candle_state(target_key)
+
+        # candle_start 파싱 ("btc_5m_2026-04-21T00:05:00+00:00")
+        try:
+            candle_start_str = target_key.split("_", 2)[2]
+            candle_start = datetime.fromisoformat(candle_start_str)
+        except Exception as e:
+            logger.error(f"[BOOK_RECOVERY] cannot parse candle_key={target_key}: {e}")
+            state["pending_book_signal"] = None
+            return
+
+        candle_end = candle_start + timedelta(minutes=5)
+        now = datetime.now(timezone.utc)
+        if now >= candle_end:
+            # 캔들이 이미 끝났으면 더 이상 발사 불가
+            state["pending_book_signal"] = None
+            return
+
+        elapsed_now = int((now - candle_start).total_seconds())
+
+        # 안전장치 1: 시간 만료
+        if elapsed_now >= CROSSING_HEDGE_CUTOFF_SECONDS:
+            self._log_signal(
+                "book_depth_expired",
+                coin=coin, side=side,
+                elapsed_seconds=elapsed_now,
+                armed_at_elapsed=target_pending.armed_at_elapsed_s,
+                wait_seconds=elapsed_now - target_pending.armed_at_elapsed_s,
+            )
+            state["pending_book_signal"] = None
+            return
+
+        # 안전장치 2: 전략 상태 무효 (failed / hedged / max 도달)
+        if state["failed"] or state["hedged"] or state["count"] >= CROSSING_MAX_COUNT:
+            self._log_signal(
+                "book_depth_drop_invalid_state",
+                coin=coin, side=side,
+                elapsed_seconds=elapsed_now,
+                failed=state["failed"], hedged=state["hedged"], count=state["count"],
+            )
+            state["pending_book_signal"] = None
+            return
+
+        # 책 재체크
+        orderbook = self.get_orderbook(coin, timeframe, side)
+        chk = self._check_book_depth(orderbook, target_pending.gtc_price, target_pending.intended_contracts)
+        if not chk["passed"]:
+            return  # 계속 대기
+
+        # 통과 → 직접 발사 (last_trade_direction parity 우회, MAX/HEDGE 등 재평가)
+        signal = strategy.fire_pending_direct(
+            direction=target_pending.direction,
+            elapsed_seconds=elapsed_now,
+            candle_key=target_key,
+        )
+        if signal is None:
+            self._log_signal(
+                "book_depth_drop_invalid_state",
+                coin=coin, side=side,
+                elapsed_seconds=elapsed_now,
+                reason="fire_pending_direct_returned_none",
+            )
+            state["pending_book_signal"] = None
+            return
+
+        wait_s = elapsed_now - target_pending.armed_at_elapsed_s
+        self._log_signal(
+            "book_depth_recovered_fire",
+            coin=coin, side=side,
+            elapsed_seconds=elapsed_now,
+            wait_seconds=wait_s,
+            best_ask=chk["best_ask"],
+            best_ask_size=chk["best_ask_size"],
+            intended_contracts=target_pending.intended_contracts,
+            actual_contracts=signal.contracts,
+            signal_reason=signal.reason,
+        )
+        state["pending_book_signal"] = None
+        self.stats["book_depth_recoveries"] += 1
+
+        # crossing_info 에 회복 메타 추가
+        crossing_info = dict(target_pending.crossing_info)
+        crossing_info["from_book_recovery"] = True
+        crossing_info["book_wait_seconds"] = wait_s
+        crossing_info["recovered_elapsed_s"] = elapsed_now
+
+        asyncio.create_task(self.execute_order(
+            coin, timeframe, signal, token_id,
+            candle_start, candle_end,
+            crossing_info=crossing_info,
+            candle_key=target_key,
+        ))
 
     async def _handle_candle_boundary(self, data: Dict):
         """캔들 경계 → 전략 리셋"""
@@ -545,8 +847,34 @@ class RealTrader5MCrossFrontService(AsyncServiceBase):
 
         strategy = self.strategies[coin]
 
-        # crossing 기록 (통계용 - 필터와 무관하게 항상 기록)
+        # === 책 깊이 pending override ===
+        # 같은 캔들에 미처리 pending 이 있으면:
+        #   - 같은 방향 새 크로싱 → 무시 (pending 유지, 중복 발사 방지)
+        #   - 반대 방향 새 크로싱 → pending 폐기 후 새 시그널 정상 처리
         state = strategy._get_candle_state(candle_key)
+        existing_pending = state.get("pending_book_signal")
+        if existing_pending is not None:
+            if existing_pending.direction == direction:
+                self._log_signal(
+                    "book_pending_dup_ignored",
+                    coin=coin, side=direction,
+                    elapsed_seconds=elapsed_seconds,
+                    pending_armed_at=existing_pending.armed_at_elapsed_s,
+                )
+                # crossing 기록은 통계용으로 추가하고 함수 종료
+                state["crossing_times"].append((elapsed_seconds, direction))
+                return
+            else:
+                self._log_signal(
+                    "book_depth_overridden",
+                    coin=coin, old_side=existing_pending.direction, new_side=direction,
+                    elapsed_seconds=elapsed_seconds,
+                    pending_armed_at=existing_pending.armed_at_elapsed_s,
+                )
+                state["pending_book_signal"] = None
+                # 그대로 아래 정상 처리로 진행
+
+        # crossing 기록 (통계용 - 필터와 무관하게 항상 기록)
         state["crossing_times"].append((elapsed_seconds, direction))
 
         # High volatility filter: 이전 2캔들 중 하나라도 crossing > 3이면 스킵
@@ -573,6 +901,40 @@ class RealTrader5MCrossFrontService(AsyncServiceBase):
         }
 
         if signal:
+            # === 책 깊이 가드 ===
+            if BOOK_DEPTH_REQUIRED:
+                chk = self._check_book_depth(orderbook, GTC_FIXED_PRICE, signal.contracts)
+                if not chk["passed"]:
+                    was_hedge = "HEDGE" in signal.reason
+                    strategy.rollback_last_signal(candle_key, was_hedge)
+                    self._log_signal(
+                        "book_depth_skip",
+                        coin=coin, side=direction,
+                        elapsed_seconds=elapsed_seconds,
+                        intended_contracts=signal.contracts,
+                        gtc_price=GTC_FIXED_PRICE,
+                        reason=chk["reason"],
+                        best_ask=chk["best_ask"],
+                        best_ask_size=chk["best_ask_size"],
+                        available=chk["available"],
+                        required=chk["required"],
+                        was_hedge=was_hedge,
+                        signal_reason=signal.reason,
+                    )
+                    if BOOK_DEPTH_PENDING_ENABLED:
+                        state["pending_book_signal"] = PendingBookSignal(
+                            direction=direction,
+                            side=direction,
+                            intended_contracts=signal.contracts,
+                            gtc_price=GTC_FIXED_PRICE,
+                            armed_at_elapsed_s=elapsed_seconds,
+                            armed_at_ts=time.time(),
+                            crossing_info=crossing_info,
+                        )
+                    self.stats["book_depth_skips"] += 1
+                    return
+                # 통과 → 일반 발사 경로
+                self.stats["book_depth_passes"] += 1
             asyncio.create_task(self.execute_order(
                 coin, tf, signal, token_id,
                 candle_start, candle_end,
@@ -787,6 +1149,44 @@ class RealTrader5MCrossFrontService(AsyncServiceBase):
                 "from_cooltime_timer": True,
             }
 
+        # === 책 깊이 가드 (cooltime 경로도 동일) ===
+        # check_pending_after_cooltime 이 _create_trade_signal 을 호출했으므로 state 는 이미 mutate 됨.
+        # 책 부족이면 rollback 후 pending_book_signal 으로 보관 (책 회복 tick 에서 재발사).
+        if BOOK_DEPTH_REQUIRED:
+            chk = self._check_book_depth(orderbook, GTC_FIXED_PRICE, signal.contracts)
+            if not chk["passed"]:
+                was_hedge = "HEDGE" in signal.reason
+                strategy.rollback_last_signal(candle_key, was_hedge)
+                self._log_signal(
+                    "book_depth_skip",
+                    coin=coin, side=signal.side,
+                    elapsed_seconds=elapsed_seconds,
+                    intended_contracts=signal.contracts,
+                    gtc_price=GTC_FIXED_PRICE,
+                    reason=chk["reason"],
+                    best_ask=chk["best_ask"],
+                    best_ask_size=chk["best_ask_size"],
+                    available=chk["available"],
+                    required=chk["required"],
+                    was_hedge=was_hedge,
+                    signal_reason=signal.reason,
+                    source="cooltime_timer",
+                )
+                if BOOK_DEPTH_PENDING_ENABLED:
+                    state = strategy._get_candle_state(candle_key)
+                    state["pending_book_signal"] = PendingBookSignal(
+                        direction=signal.side,
+                        side=signal.side,
+                        intended_contracts=signal.contracts,
+                        gtc_price=GTC_FIXED_PRICE,
+                        armed_at_elapsed_s=elapsed_seconds,
+                        armed_at_ts=time.time(),
+                        crossing_info=crossing_info,
+                    )
+                self.stats["book_depth_skips"] += 1
+                return
+            self.stats["book_depth_passes"] += 1
+
         await self.execute_order(
             coin, timeframe, signal, token_id,
             candle_start, candle_end,
@@ -801,39 +1201,33 @@ class RealTrader5MCrossFrontService(AsyncServiceBase):
         target_contracts: int,
         gtc_price: float,
     ) -> Dict[str, Any]:
-        from py_clob_client.clob_types import OrderArgs, OrderType
-        from py_clob_client.order_builder.constants import BUY
+        # V2: book을 크로스하는 GTC는 strict reject(400). 본 전략은 book guard로
+        # best_ask <= gtc_price 임을 확인 후 발사하므로 의도가 항상 taker → FAK 사용.
+        # FAK = Fill-And-Kill (IOC): 가능한 만큼 체결, 잔여 즉시 취소 (maker rest 없음).
+        from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions, Side
 
         start_time = time.time()
         order_price = gtc_price
 
         try:
             cached = self.token_info_cache.get(token_id)
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=order_price,
+                size=float(target_contracts),
+                side=Side.BUY,
+            )
             if cached:
-                from py_clob_client.clob_types import PartialCreateOrderOptions
-                order_args = OrderArgs(
-                    token_id=token_id,
-                    price=order_price,
-                    size=float(target_contracts),
-                    side=BUY,
-                    fee_rate_bps=cached["fee_rate"],
-                )
                 options = PartialCreateOrderOptions(
                     tick_size=cached["tick_size"],
                     neg_risk=cached["neg_risk"],
                 )
                 signed_order = self.clob_client.create_order(order_args, options)
             else:
-                order_args = OrderArgs(
-                    token_id=token_id,
-                    price=order_price,
-                    size=float(target_contracts),
-                    side=BUY,
-                )
                 signed_order = self.clob_client.create_order(order_args)
 
-            response = self.clob_client.post_order(signed_order, OrderType.GTC)
-            logger.info(f"[GTC] CLOB response (price={order_price}, size={target_contracts}): {response}")
+            response = self.clob_client.post_order(signed_order, OrderType.FAK)
+            logger.info(f"[FAK] CLOB response (price={order_price}, size={target_contracts}): {response}")
 
             if isinstance(response, dict):
                 order_id = response.get("orderID") or response.get("orderId", "")
@@ -899,7 +1293,7 @@ class RealTrader5MCrossFrontService(AsyncServiceBase):
         except Exception as e:
             error_msg = str(e)
             total_latency = (time.time() - start_time) * 1000
-            logger.error(f"[GTC] Exception: {error_msg}")
+            logger.error(f"[FAK] Exception: {error_msg}")
 
             return {
                 "success": False,
@@ -1378,6 +1772,9 @@ class RealTrader5MCrossFrontService(AsyncServiceBase):
                 f"crossing={self.stats.get('crossing_events', 0)} | "
                 f"filled={self.stats.get('orders_filled', 0)} | "
                 f"failed={self.stats.get('orders_failed', 0)} | "
+                f"book_pass={self.stats.get('book_depth_passes', 0)} | "
+                f"book_skip={self.stats.get('book_depth_skips', 0)} | "
+                f"book_recover={self.stats.get('book_depth_recoveries', 0)} | "
                 f"trades={self.stats['trades_created']}/{self.stats['trades_settled']} | "
                 f"status={strategy_status}"
             )
@@ -1399,16 +1796,19 @@ class RealTrader5MCrossFrontService(AsyncServiceBase):
     # =========================================================================
     async def run(self):
         logger.info("=" * 60)
-        logger.info("Real Trader 5M Improve: Max5 + 속도필터 전략")
+        logger.info(f"Real Trader 5M Improve: Max{CROSSING_MAX_COUNT} + 속도필터 + 책깊이 가드")
         logger.info("=" * 60)
         logger.info(f"Strategy: {STRATEGY_NAME}")
         logger.info(f"  Entry zone: 0s ~ {CROSSING_ENTRY_CUTOFF_SECONDS}s")
         logger.info(f"  Hedge zone: {CROSSING_ENTRY_CUTOFF_SECONDS}s ~ {CROSSING_HEDGE_CUTOFF_SECONDS}s")
         logger.info(f"  Forbidden: {CROSSING_HEDGE_CUTOFF_SECONDS}s+")
-        logger.info(f"  #1: x{CROSSING_BET_CONTRACT_UNIT}, #2~4: x{CROSSING_BET_CONTRACT_UNIT*2}, hedge: x{CROSSING_BET_CONTRACT_UNIT}")
+        logger.info(f"  Max entries: {CROSSING_MAX_COUNT} (last entry forced as HEDGE_MAX)")
+        logger.info(f"  Sizes: #1=x{CROSSING_BET_CONTRACT_UNIT}, #2~{CROSSING_MAX_COUNT-1}=x{CROSSING_BET_CONTRACT_UNIT*2}, hedge=x{CROSSING_BET_CONTRACT_UNIT}")
         logger.info(f"  Speed filter: {SPEED_FILTER_MAX_CROSSINGS} crossings in {SPEED_FILTER_WINDOW_SECONDS}s → hedge")
         logger.info(f"  GTC price: {GTC_FIXED_PRICE} (fixed)")
         logger.info(f"  Cooltime: {COOLTIME_SECONDS}s")
+        logger.info(f"  Book depth guard: required={BOOK_DEPTH_REQUIRED} safety={BOOK_DEPTH_SAFETY} pending={BOOK_DEPTH_PENDING_ENABLED}")
+        logger.info(f"  Signals log: {self._signals_log_path}")
         logger.info(f"Coins: {COINS} | Timeframes: {TIMEFRAMES}")
         logger.info(f"Telegram: {'enabled' if TELEGRAM_BOT_TOKEN else 'disabled'}")
         logger.info("=" * 60)
@@ -1420,7 +1820,8 @@ class RealTrader5MCrossFrontService(AsyncServiceBase):
                 f"<b>[STARTUP]</b> {STRATEGY_NAME}\n"
                 f"Entry: 0~{CROSSING_ENTRY_CUTOFF_SECONDS}s | Hedge: {CROSSING_ENTRY_CUTOFF_SECONDS}~{CROSSING_HEDGE_CUTOFF_SECONDS}s\n"
                 f"Speed: {SPEED_FILTER_MAX_CROSSINGS}x/{SPEED_FILTER_WINDOW_SECONDS}s | Max {CROSSING_MAX_COUNT}x\n"
-                f"GTC {GTC_FIXED_PRICE} | Cooltime {COOLTIME_SECONDS}s | Live: ON"
+                f"GTC {GTC_FIXED_PRICE} | Cooltime {COOLTIME_SECONDS}s | Live: ON\n"
+                f"BookGuard: {'ON' if BOOK_DEPTH_REQUIRED else 'OFF'} (safety {BOOK_DEPTH_SAFETY}, pending {'ON' if BOOK_DEPTH_PENDING_ENABLED else 'OFF'})"
             )
         else:
             logger.warning("LIVE TRADING DISABLED (no credentials)")

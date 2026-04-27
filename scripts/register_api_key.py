@@ -16,7 +16,7 @@ print("CLOB API Key Registration")
 print("=" * 60)
 
 try:
-    from py_clob_client.client import ClobClient
+    from py_clob_client_v2 import ClobClient
 
     print("\n[1] Creating ClobClient...")
     client = ClobClient(
@@ -47,8 +47,8 @@ try:
     except Exception as e:
         print(f"  create_api_key failed: {e}")
 
-        print("\n[2b] Trying create_or_derive_api_creds (creates if not exists)...")
-        api_creds = client.create_or_derive_api_creds()
+        print("\n[2b] Trying create_or_derive_api_key (creates if not exists)...")
+        api_creds = client.create_or_derive_api_key()
         print(f"  API Key: {api_creds.api_key}")
         client.set_api_creds(api_creds)
 

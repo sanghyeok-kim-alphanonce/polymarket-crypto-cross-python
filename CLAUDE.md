@@ -98,6 +98,41 @@ poly-test/
 - GTC 고정가 0.70
 ```
 
+## Polymarket CLOB V2 (2026-04-28 cutover)
+
+### 코드 측 변경 (이미 적용됨)
+- 의존성: `py-clob-client` → `py-clob-client-v2>=1.0.0`
+- 모듈: `py_clob_client.*` → `py_clob_client_v2.*`
+- API 키 메서드명: `create_or_derive_api_creds()` → `create_or_derive_api_key()`
+- OrderArgs에서 `fee_rate_bps` 제거 (V2는 protocol에서 fee 자동 계산)
+- 초기화 직후 `update_balance_allowance(asset_type=COLLATERAL)` 호출 추가
+  (없으면 첫 주문이 stale balance/allowance cache로 reject됨)
+- 주문 타입: `OrderType.GTC` → `OrderType.FAK` (V2에서 book을 cross하는 GTC는
+  strict reject. 본 전략들은 GTC 0.70~0.90 고정으로 항상 시세 위 → 의도가 taker)
+- Builder code 옵션 추가 (`POLYMARKET_BUILDER_CODE` env, 미설정 시 attribution 없이 거래)
+- WebSocket / Gamma API URL은 V2에서도 동일 (변경 없음)
+
+### Cutover 운영 절차 (한 번만, 4/27 EOD까지)
+운영 Safe에 V2 approve 배치 + USDC.e → pUSD wrap을 relayer로 제출해야 함.
+- USDC.e → V2 Exchange / V2 NegRisk / NegRiskAdapter / Onramp approve
+- pUSD → V2 Exchange / V2 NegRisk / NegRiskAdapter approve
+- CTF setApprovalForAll → V2 Exchange / V2 NegRisk / NegRiskAdapter
+- USDC.e → pUSD wrap (Onramp.wrap)
+
+자세한 절차는 `/Users/alphanonce/Downloads/poly-v2-api/migration-knowhow.md` 참조.
+
+### Cutover 이후 (4/28 ~11:00 UTC)
+- 모든 open order는 wipe됨 → 자동 재발사 (정상 동작)
+- `clob.polymarket.com`은 V2 backend로 자동 교체 → URL 변경 불필요
+- 4/28 이전 V2 미리 검증: `POLYMARKET_HOST=https://clob-v2.polymarket.com`
+
+### Claim 서비스 (services/claimer)
+- Builder Relayer 인증은 V1/V2 동일 (변경 없음)
+- `redeemPositions`의 `collateralToken`은 마켓 생성 시점의 collateral과 일치해야 함:
+  - cutover 이전 마켓: USDC.e (`0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174`)
+  - cutover 이후 마켓: pUSD (`0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB`)
+- 단일 collateral 가정. 환경변수 `CLAIM_COLLATERAL_ADDRESS`로 오버라이드 가능.
+
 ## 실행 방법
 
 ### ⚠️ 중요: 환경변수 충돌 방지

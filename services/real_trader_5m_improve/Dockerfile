@@ -6,10 +6,7 @@ RUN pip install --no-cache-dir \
     asyncpg \
     redis \
     aiohttp \
-    py-clob-client
-
-# Patch py_clob_client http_helpers for configurable timeout
-COPY services/real_trader_5m_improve/patches/http_helpers.py /usr/local/lib/python3.11/site-packages/py_clob_client/http_helpers/helpers.py
+    py-clob-client-v2
 
 COPY packages/polymarket_common /app/packages/polymarket_common
 COPY packages/service_common /app/packages/service_common

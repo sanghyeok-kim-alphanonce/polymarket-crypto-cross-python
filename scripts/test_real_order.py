@@ -143,9 +143,7 @@ async def place_test_order(token_id: str, price: float, contracts: int, max_bump
         return None
 
     try:
-        from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import OrderArgs, OrderType
-        from py_clob_client.order_builder.constants import BUY
+        from py_clob_client_v2 import ClobClient, OrderArgs, OrderType, Side
 
         print(f"[CLOB] Initializing client...")
         print(f"  Host: {POLYMARKET_HOST}")
@@ -161,9 +159,9 @@ async def place_test_order(token_id: str, price: float, contracts: int, max_bump
             funder=POLYMARKET_PROXY_ADDRESS,
         )
 
-        # API credentials 생성
+        # API credentials 생성 (V2: create_or_derive_api_key)
         print("[CLOB] Creating API credentials...")
-        api_creds = client.create_or_derive_api_creds()
+        api_creds = client.create_or_derive_api_key()
         client.set_api_creds(api_creds)
         print("[CLOB] API credentials set")
 
@@ -181,7 +179,7 @@ async def place_test_order(token_id: str, price: float, contracts: int, max_bump
                 token_id=token_id,
                 price=adjusted_price,
                 size=float(contracts),
-                side=BUY,
+                side=Side.BUY,
             )
 
             signed_order = client.create_order(order_args)
@@ -212,7 +210,7 @@ async def place_test_order(token_id: str, price: float, contracts: int, max_bump
         return None
 
     except ImportError:
-        print("[CLOB] py-clob-client not installed. Run: pip install py-clob-client")
+        print("[CLOB] py-clob-client-v2 not installed. Run: pip install py-clob-client-v2")
         return None
     except Exception as e:
         print(f"[CLOB] Error: {e}")

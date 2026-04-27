@@ -23,7 +23,7 @@ print(f"\nEOA Address: {eoa_address}")
 print(f"Proxy in .env: {POLYMARKET_PROXY_ADDRESS}")
 
 try:
-    from py_clob_client.client import ClobClient
+    from py_clob_client_v2 import ClobClient
 
     # 방법 1: funder 없이 클라이언트 생성해서 proxy wallet 조회
     print("\n[1] Creating client WITHOUT funder to derive proxy...")
@@ -57,7 +57,7 @@ try:
     )
 
     try:
-        api_creds = client2.create_or_derive_api_creds()
+        api_creds = client2.create_or_derive_api_key()
         print(f"  API Key: {api_creds.api_key}")
         client2.set_api_creds(api_creds)
 
