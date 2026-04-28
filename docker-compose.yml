@@ -222,7 +222,7 @@ services:
       # V2: Builder code (선택). Builder 프로그램 등록한 경우만.
       POLYMARKET_BUILDER_CODE: ${POLYMARKET_BUILDER_CODE:-}
       # V2 검증용 (선택, 4/28 이전): https://clob-v2.polymarket.com
-      POLYMARKET_HOST: ${POLYMARKET_HOST:-}
+      POLYMARKET_HOST: ${POLYMARKET_HOST:-https://clob.polymarket.com}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       TELEGRAM_THREAD_ID: ${TELEGRAM_THREAD_ID:-}
@@ -263,7 +263,7 @@ services:
       # 기본값 USDC.e (V1, cutover 이전 마켓). cutover 이후 새 마켓은 pUSD 사용 필요.
       CLAIM_COLLATERAL_ADDRESS: ${CLAIM_COLLATERAL_ADDRESS:-}
       # V2 검증용 (선택, 4/28 이전): https://clob-v2.polymarket.com
-      POLYMARKET_HOST: ${POLYMARKET_HOST:-}
+      POLYMARKET_HOST: ${POLYMARKET_HOST:-https://clob.polymarket.com}
       # Telegram 알림
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
@@ -407,7 +407,7 @@ services:
       # V2: Builder code (선택). Builder 프로그램 등록한 경우만.
       POLYMARKET_BUILDER_CODE: ${POLYMARKET_BUILDER_CODE:-}
       # V2 검증용 (선택, 4/28 이전): https://clob-v2.polymarket.com
-      POLYMARKET_HOST: ${POLYMARKET_HOST:-}
+      POLYMARKET_HOST: ${POLYMARKET_HOST:-https://clob.polymarket.com}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       TELEGRAM_THREAD_ID: ${TELEGRAM_THREAD_ID:-}
@@ -459,7 +459,7 @@ services:
       # V2: Builder code (선택). Builder 프로그램 등록한 경우만.
       POLYMARKET_BUILDER_CODE: ${POLYMARKET_BUILDER_CODE:-}
       # V2 검증용 (선택, 4/28 이전): https://clob-v2.polymarket.com
-      POLYMARKET_HOST: ${POLYMARKET_HOST:-}
+      POLYMARKET_HOST: ${POLYMARKET_HOST:-https://clob.polymarket.com}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       TELEGRAM_THREAD_ID: ${TELEGRAM_THREAD_ID:-}
