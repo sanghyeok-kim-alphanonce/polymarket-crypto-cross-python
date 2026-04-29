@@ -258,10 +258,10 @@ services:
       ACCOUNT_1_PROXY_ADDRESS: ${POLYMARKET_PROXY_ADDRESS:-}
       ACCOUNT_1_NAME: main
       # 설정
-      CLAIM_INTERVAL: 3600
-      # V2: redeemPositions의 collateralToken 오버라이드 (선택).
-      # 기본값 USDC.e (V1, cutover 이전 마켓). cutover 이후 새 마켓은 pUSD 사용 필요.
-      CLAIM_COLLATERAL_ADDRESS: ${CLAIM_COLLATERAL_ADDRESS:-}
+      CLAIM_INTERVAL: 1800
+      # 마켓별 collateral은 on-chain CTF.getPositionId로 자동 판별 (USDC.e / pUSD).
+      # Polygon RPC URL — keyless 기본값. 필요 시 .env에서 사설 RPC로 override.
+      POLYGON_RPC_URL: ${POLYGON_RPC_URL:-https://polygon-bor-rpc.publicnode.com}
       # V2 검증용 (선택, 4/28 이전): https://clob-v2.polymarket.com
       POLYMARKET_HOST: ${POLYMARKET_HOST:-https://clob.polymarket.com}
       # Telegram 알림

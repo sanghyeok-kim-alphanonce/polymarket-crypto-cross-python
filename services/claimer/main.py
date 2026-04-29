@@ -45,7 +45,7 @@ import signal
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import httpx
 from web3 import Web3
@@ -90,14 +90,24 @@ async def tg_send(text: str):
 # Polygon Mainnet Contract Addresses
 # CTF (Conditional Tokens) 주소는 V1/V2 동일.
 CONDITIONAL_TOKENS_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-# Collateral 주소: V1 = USDC.e, V2 = pUSD (2026-04-28 cutover).
+# Collateral 주소: 2026-04-28 cutover로 pUSD 신규, USDC.e 기존.
 # `redeemPositions(collateralToken, ...)` 의 collateralToken은 마켓 생성 시점의
-# collateral과 일치해야 함. cutover 이전 마켓은 USDC.e, 이후 마켓은 pUSD.
+# collateral과 일치해야 하므로, 마켓별로 on-chain CTF.getPositionId 매칭으로 자동 결정한다.
 USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 PUSD_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
-# 기본값은 환경변수로 오버라이드 가능 (cutover 이후 새 마켓 redeem 시 PUSD로 변경).
-# 더 정교하게는 마켓별로 collateral을 조회해야 하지만, 단일 collateral 가정 유지.
-USDC_ADDRESS = os.environ.get("CLAIM_COLLATERAL_ADDRESS", USDC_E_ADDRESS)
+# Onramp.wrap(asset, recipient, amount) — converts USDC.e → pUSD on-chain.
+# V2 markets use pUSD; redeemed USDC.e from V1-collateralized markets must be
+# wrapped manually (otherwise Polymarket UI shows "Activate Funds").
+COLLATERAL_ONRAMP_ADDRESS = "0x93070a847efEf7F70739046A929D47a521F5B8ee"
+COLLATERAL_CANDIDATES: List[Tuple[str, str]] = [
+    (USDC_E_ADDRESS, "USDC.e"),
+    (PUSD_ADDRESS, "pUSD"),
+]
+# Polygon RPC for on-chain collateral resolution (CTF view calls).
+# polygon-rpc.com requires an API key now; publicnode is keyless.
+POLYGON_RPC_URL = os.environ.get(
+    "POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com"
+)
 
 # Relayer URL (v2 for gasless transactions)
 RELAYER_URL = "https://relayer-v2.polymarket.com"
@@ -134,6 +144,34 @@ CONDITIONAL_TOKENS_ABI = [
         "type": "function",
     }
 ]
+
+# Onramp.wrap(asset, recipient, amount) — converts USDC.e → pUSD.
+ONRAMP_WRAP_ABI = [
+    {
+        "inputs": [
+            {"name": "asset", "type": "address"},
+            {"name": "recipient", "type": "address"},
+            {"name": "amount", "type": "uint256"},
+        ],
+        "name": "wrap",
+        "outputs": [],
+        "type": "function",
+    }
+]
+ERC20_APPROVE_ABI = [
+    {
+        "inputs": [
+            {"name": "spender", "type": "address"},
+            {"name": "amount", "type": "uint256"},
+        ],
+        "name": "approve",
+        "outputs": [{"type": "bool"}],
+        "type": "function",
+    }
+]
+# ERC20 balanceOf selector for eth_call.
+_ERC20_BALANCE_OF_SEL = "70a08231"
+_MAX_UINT256 = (1 << 256) - 1
 
 
 # =============================================================================
@@ -258,6 +296,7 @@ class ClaimablePosition:
     quantity: float
     payout_amount: float
     redeemable: bool
+    collateral: str = ""  # CTF collateralToken — resolved per-market on-chain
 
 
 @dataclass
@@ -287,6 +326,106 @@ class BatchClaimResult:
 
 
 # =============================================================================
+# Collateral Resolver (on-chain CTF.getPositionId lookup)
+# =============================================================================
+
+
+# selector("getCollectionId(bytes32,bytes32,uint256)") = 0x856296f7
+_GET_COLLECTION_ID_SEL = "856296f7"
+# selector("getPositionId(address,bytes32)") = 0x39dd7530
+_GET_POSITION_ID_SEL = "39dd7530"
+
+
+class CollateralResolver:
+    """Resolve a position's collateral by matching the CTF positionId on-chain.
+
+    data-api returns `asset` (=CTF positionId). Each positionId is derived from
+    (collateralToken, conditionId, indexSet). We brute-force match against known
+    collateral candidates so the redeemPositions call uses the correct token —
+    otherwise the CTF silently no-ops (no revert, no payout).
+    """
+
+    def __init__(self, http_client: httpx.AsyncClient, rpc_url: str = POLYGON_RPC_URL):
+        self._client = http_client
+        self._rpc_url = rpc_url
+        self._cache: Dict[str, str] = {}  # conditionId(0x…) -> collateral address
+
+    async def _eth_call(self, data_hex: str) -> str:
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [{"to": CONDITIONAL_TOKENS_ADDRESS, "data": data_hex}, "latest"],
+            "id": 1,
+        }
+        r = await self._client.post(self._rpc_url, json=payload, timeout=15.0)
+        r.raise_for_status()
+        body = r.json()
+        if "error" in body:
+            raise RuntimeError(f"eth_call error: {body['error']}")
+        return body["result"]
+
+    async def _get_position_id(
+        self, collateral: str, condition_id_hex: str, index_set: int
+    ) -> int:
+        cond = condition_id_hex.replace("0x", "")
+        zero32 = "00" * 32
+        idx32 = index_set.to_bytes(32, "big").hex()
+        coll_id_hex = await self._eth_call(
+            "0x" + _GET_COLLECTION_ID_SEL + zero32 + cond + idx32
+        )
+        addr_padded = ("00" * 12) + collateral.lower().replace("0x", "")
+        pid_hex = await self._eth_call(
+            "0x" + _GET_POSITION_ID_SEL + addr_padded + coll_id_hex.replace("0x", "")
+        )
+        return int(pid_hex, 16)
+
+    async def get_erc20_balance(self, token_address: str, holder: str) -> int:
+        """Generic ERC20 balanceOf via the same eth_call infra. 0 on failure."""
+        addr_padded = ("00" * 12) + holder.lower().replace("0x", "")
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [
+                {"to": token_address, "data": "0x" + _ERC20_BALANCE_OF_SEL + addr_padded},
+                "latest",
+            ],
+            "id": 1,
+        }
+        try:
+            r = await self._client.post(self._rpc_url, json=payload, timeout=15.0)
+            r.raise_for_status()
+            body = r.json()
+            if "error" in body:
+                logger.warning(f"balanceOf eth_call error: {body['error']}")
+                return 0
+            return int(body["result"], 16)
+        except Exception as e:
+            logger.warning(f"balanceOf eth_call failed: {e}")
+            return 0
+
+    async def detect(self, condition_id: str, asset_id: str) -> Optional[str]:
+        """Return the matching collateral address, or None on no match / failure."""
+        cid = condition_id if condition_id.startswith("0x") else "0x" + condition_id
+        if cid in self._cache:
+            return self._cache[cid]
+        try:
+            target = int(asset_id)
+        except (TypeError, ValueError):
+            return None
+        for addr, _name in COLLATERAL_CANDIDATES:
+            for index_set in BINARY_INDEX_SETS:
+                try:
+                    pid = await self._get_position_id(addr, cid, index_set)
+                except Exception as e:
+                    logger.warning(f"eth_call failed for {cid[:20]}...: {e}")
+                    return None
+                if pid == target:
+                    self._cache[cid] = addr
+                    return addr
+        return None
+
+
+# =============================================================================
 # Position Detector
 # =============================================================================
 
@@ -298,6 +437,7 @@ class PositionDetector:
         self.proxy_address = proxy_address
         self.data_api_url = "https://data-api.polymarket.com"
         self.http_client = httpx.AsyncClient(timeout=30.0)
+        self.resolver = CollateralResolver(self.http_client)
         self.claimed_cache: Set[str] = set()
 
     async def get_positions(self) -> List[Dict]:
@@ -334,14 +474,26 @@ class PositionDetector:
             if quantity <= 0:
                 continue
 
+            asset_id = pos.get("asset", "")
+            collateral = await self.resolver.detect(condition_id, asset_id)
+            if collateral is None:
+                # NegRisk markets use NegRiskAdapter (different positionId derivation).
+                # Skip rather than risk a silent no-op redeem with the wrong collateral.
+                logger.warning(
+                    f"Skipping {condition_id[:20]}... — collateral unresolved "
+                    f"(negRisk={pos.get('negativeRisk')}, asset={asset_id[:24]}...)"
+                )
+                continue
+
             claimable.append(
                 ClaimablePosition(
                     condition_id=condition_id,
                     token_id=pos.get("tokenId", ""),
-                    asset=pos.get("asset", ""),
+                    asset=asset_id,
                     quantity=quantity,
                     payout_amount=quantity,
                     redeemable=True,
+                    collateral=collateral,
                 )
             )
 
@@ -372,10 +524,90 @@ class ClaimExecutor:
             address=self.web3.to_checksum_address(CONDITIONAL_TOKENS_ADDRESS),
             abi=CONDITIONAL_TOKENS_ABI,
         )
+        self.onramp_contract = self.web3.eth.contract(
+            address=self.web3.to_checksum_address(COLLATERAL_ONRAMP_ADDRESS),
+            abi=ONRAMP_WRAP_ABI,
+        )
+        self.usdc_e_contract = self.web3.eth.contract(
+            address=self.web3.to_checksum_address(USDC_E_ADDRESS),
+            abi=ERC20_APPROVE_ABI,
+        )
 
         logger.info(
             "ClaimExecutor initialized (gasless via Builder Relayer with key rotation)"
         )
+
+    def _build_wrap_calldata(self, recipient: str, amount_units: int) -> str:
+        """Onramp.wrap(USDC.e, recipient, amount_units) — converts USDC.e → pUSD."""
+        return self.onramp_contract.encode_abi(
+            abi_element_identifier="wrap",
+            args=[
+                self.web3.to_checksum_address(USDC_E_ADDRESS),
+                self.web3.to_checksum_address(recipient),
+                amount_units,
+            ],
+        )
+
+    async def wrap_usdc_to_pusd(self, recipient: str, amount_units: int) -> dict:
+        """Wrap a specific amount of Safe USDC.e to pUSD via Builder Relayer."""
+        calldata = self._build_wrap_calldata(recipient, amount_units)
+        try:
+            return await asyncio.to_thread(self._execute_wrap_via_relayer, calldata)
+        except Exception as e:
+            logger.error(f"wrap_usdc_to_pusd error: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _execute_wrap_via_relayer(self, calldata: str) -> dict:
+        from py_builder_relayer_client.models import SafeTransaction, OperationType
+
+        creds = self.key_manager.get_current_credentials()
+        if not creds:
+            return {"success": False, "error": "No Builder API credentials available"}
+
+        # Bundle USDC.e.approve(Onramp, MAX_UINT256) + Onramp.wrap(...) into one
+        # Safe meta-tx. approve(MAX) is idempotent — safe to send every cycle —
+        # and prevents revert when the cutover allowance was never set.
+        approve_calldata = self.usdc_e_contract.encode_abi(
+            abi_element_identifier="approve",
+            args=[
+                self.web3.to_checksum_address(COLLATERAL_ONRAMP_ADDRESS),
+                _MAX_UINT256,
+            ],
+        )
+        approve_tx = SafeTransaction(
+            to=USDC_E_ADDRESS,
+            operation=OperationType.Call,
+            data=approve_calldata,
+            value="0",
+        )
+        wrap_tx = SafeTransaction(
+            to=COLLATERAL_ONRAMP_ADDRESS,
+            operation=OperationType.Call,
+            data=calldata,
+            value="0",
+        )
+        try:
+            relay_client = self._create_relay_client(creds)
+            response = relay_client.execute(
+                transactions=[approve_tx, wrap_tx],
+                metadata="Approve+Wrap USDC.e -> pUSD",
+            )
+            result = response.wait()
+            if result:
+                self.key_manager.mark_success()
+                return {
+                    "success": True,
+                    "tx_hash": result.get("transactionHash"),
+                    "transaction_id": response.transaction_id,
+                }
+            return {"success": False, "error": "Wrap tx failed or timed out"}
+        except Exception as e:
+            error_str = str(e)
+            logger.error(f"Wrap relayer execution error: {error_str}")
+            if self._is_rate_limit_error(error_str):
+                reset_time = self._extract_reset_time(error_str)
+                self.key_manager.mark_rate_limited(reset_time)
+            return {"success": False, "error": error_str}
 
     def _create_relay_client(self, creds: BuilderCredentials):
         """Create a new RelayClient with given credentials."""
@@ -398,7 +630,7 @@ class ClaimExecutor:
             builder_config=builder_config,
         )
 
-    def _build_redeem_calldata(self, condition_id: str) -> str:
+    def _build_redeem_calldata(self, condition_id: str, collateral_address: str) -> str:
         """Build calldata for redeemPositions function."""
         if not condition_id.startswith("0x"):
             condition_id = "0x" + condition_id
@@ -408,7 +640,7 @@ class ClaimExecutor:
         calldata = self.ctf_contract.encode_abi(
             abi_element_identifier="redeemPositions",
             args=[
-                self.web3.to_checksum_address(USDC_ADDRESS),
+                self.web3.to_checksum_address(collateral_address),
                 PARENT_COLLECTION_ID,
                 condition_bytes,
                 BINARY_INDEX_SETS,
@@ -436,7 +668,7 @@ class ClaimExecutor:
             return int(match.group(1))
         return 300
 
-    async def claim(self, condition_id: str) -> ClaimResult:
+    async def claim(self, condition_id: str, collateral_address: str) -> ClaimResult:
         """Claim a winning position (GASLESS)."""
         if not condition_id.startswith("0x"):
             condition_id = "0x" + condition_id
@@ -448,7 +680,7 @@ class ClaimExecutor:
                 error=f"Invalid condition_id length: {len(condition_id)}",
             )
 
-        calldata = self._build_redeem_calldata(condition_id)
+        calldata = self._build_redeem_calldata(condition_id, collateral_address)
         logger.info(f"Claiming condition (gasless): {condition_id[:20]}...")
 
         try:
@@ -515,41 +747,45 @@ class ClaimExecutor:
 
             return {"success": False, "error": error_str}
 
-    async def claim_batch(self, condition_ids: List[str]) -> BatchClaimResult:
-        """Claim multiple winning positions in a single transaction (GASLESS)."""
-        if not condition_ids:
+    async def claim_batch(self, items: List[Tuple[str, str]]) -> BatchClaimResult:
+        """Claim multiple winning positions in a single transaction (GASLESS).
+
+        Each item is (condition_id, collateral_address). Mixing collaterals in
+        the same batch is fine — each redeemPositions call carries its own
+        collateralToken parameter.
+        """
+        if not items:
             return BatchClaimResult(
-                condition_ids=[], success=False, error="No condition_ids provided"
+                condition_ids=[], success=False, error="No items provided"
             )
 
-        valid_condition_ids = []
-        for cid in condition_ids:
+        valid_items: List[Tuple[str, str]] = []
+        for cid, collateral in items:
             if not cid.startswith("0x"):
                 cid = "0x" + cid
             if len(cid) == 66:
-                valid_condition_ids.append(cid)
+                valid_items.append((cid, collateral))
             else:
                 logger.warning(
                     f"Skipping invalid condition_id: {cid[:20]}... (len={len(cid)})"
                 )
 
-        if not valid_condition_ids:
+        if not valid_items:
             return BatchClaimResult(
-                condition_ids=condition_ids,
+                condition_ids=[c for c, _ in items],
                 success=False,
                 error="No valid condition_ids after validation",
             )
 
-        logger.info(
-            f"Batch claiming {len(valid_condition_ids)} positions (gasless)..."
-        )
+        valid_cids = [c for c, _ in valid_items]
+        logger.info(f"Batch claiming {len(valid_items)} positions (gasless)...")
 
         try:
             result = await asyncio.to_thread(
-                self._execute_batch_via_relayer, valid_condition_ids
+                self._execute_batch_via_relayer, valid_items
             )
             return BatchClaimResult(
-                condition_ids=valid_condition_ids,
+                condition_ids=valid_cids,
                 success=result["success"],
                 tx_hash=result.get("tx_hash"),
                 transaction_id=result.get("transaction_id"),
@@ -558,12 +794,12 @@ class ClaimExecutor:
         except Exception as e:
             logger.error(f"Batch claim error: {e}")
             return BatchClaimResult(
-                condition_ids=valid_condition_ids,
+                condition_ids=valid_cids,
                 success=False,
                 error=str(e),
             )
 
-    def _execute_batch_via_relayer(self, condition_ids: List[str]) -> dict:
+    def _execute_batch_via_relayer(self, items: List[Tuple[str, str]]) -> dict:
         """Execute batch transaction via Builder Relayer (GASLESS)."""
         from py_builder_relayer_client.models import SafeTransaction, OperationType
 
@@ -572,12 +808,12 @@ class ClaimExecutor:
             return {"success": False, "error": "No Builder API credentials available"}
 
         logger.info(
-            f"Using Builder Key #{creds.index} for batch of {len(condition_ids)}"
+            f"Using Builder Key #{creds.index} for batch of {len(items)}"
         )
 
         transactions = []
-        for condition_id in condition_ids:
-            calldata = self._build_redeem_calldata(condition_id)
+        for condition_id, collateral in items:
+            calldata = self._build_redeem_calldata(condition_id, collateral)
             tx = SafeTransaction(
                 to=CONDITIONAL_TOKENS_ADDRESS,
                 operation=OperationType.Call,
@@ -599,7 +835,7 @@ class ClaimExecutor:
             if result:
                 self.key_manager.mark_success()
                 logger.info(
-                    f"Batch claim SUCCESS: {len(condition_ids)} positions, "
+                    f"Batch claim SUCCESS: {len(items)} positions, "
                     f"tx={result.get('transactionHash', 'N/A')[:20]}..."
                 )
                 return {
@@ -755,13 +991,29 @@ class AccountClaimer:
 
         logger.info(f"[{self.name}] Starting claim detection...")
 
+        claimable: List[ClaimablePosition] = []
         try:
             claimable = await self.detector.detect_claimable()
+        except Exception as e:
+            logger.error(f"[{self.name}] Detection error: {e}")
 
-            if not claimable:
-                logger.info(f"[{self.name}] No claimable positions")
-                return results
+        if not claimable:
+            logger.info(f"[{self.name}] No claimable positions")
+        else:
+            results.extend(await self._process_claimable(claimable))
 
+        # Always wrap pending USDC.e regardless of claim outcome (skipped in dry-run).
+        if not self.dry_run:
+            await self._wrap_pending_usdc_e()
+
+        return results
+
+    async def _process_claimable(
+        self, claimable: List[ClaimablePosition]
+    ) -> List[ClaimResult]:
+        """Run the batch claim loop for a list of claimable positions."""
+        results: List[ClaimResult] = []
+        try:
             total_amount = sum(p.payout_amount for p in claimable)
             logger.info(
                 f"[{self.name}] Found {len(claimable)} claimable, "
@@ -771,7 +1023,7 @@ class AccountClaimer:
             # Balance before claim
             balance_before = self._get_usdc_balance()
             if balance_before is not None:
-                logger.info(f"[{self.name}] USDC.e before claim: ${balance_before:.2f}")
+                logger.info(f"[{self.name}] collateral before claim: ${balance_before:.2f}")
 
             if self.dry_run:
                 for pos in claimable:
@@ -791,20 +1043,24 @@ class AccountClaimer:
                 )
                 position_map[cid] = pos
 
-            # Process in batches with fallback to smaller sizes
-            pending_ids = list(position_map.keys())
+            # Process in batches with fallback to smaller sizes.
+            # pending items carry per-position collateral (auto-resolved).
+            pending_items: List[Tuple[str, str]] = [
+                (cid, pos.collateral) for cid, pos in position_map.items()
+            ]
             batch_size_idx = 0
 
-            while pending_ids and batch_size_idx < len(BATCH_SIZES):
+            while pending_items and batch_size_idx < len(BATCH_SIZES):
                 batch_size = BATCH_SIZES[batch_size_idx]
-                batch_ids = pending_ids[:batch_size]
+                batch_items = pending_items[:batch_size]
+                batch_ids = [c for c, _ in batch_items]
 
                 logger.info(
-                    f"[{self.name}] Attempting batch claim: {len(batch_ids)} "
+                    f"[{self.name}] Attempting batch claim: {len(batch_items)} "
                     f"positions (batch_size={batch_size})"
                 )
 
-                batch_result = await self.executor.claim_batch(batch_ids)
+                batch_result = await self.executor.claim_batch(batch_items)
 
                 if batch_result.success:
                     for cid in batch_ids:
@@ -823,15 +1079,15 @@ class AccountClaimer:
                             )
 
                     logger.info(
-                        f"[{self.name}] BATCH CLAIMED: {len(batch_ids)} positions, "
+                        f"[{self.name}] BATCH CLAIMED: {len(batch_items)} positions, "
                         f"tx={batch_result.tx_hash}"
                     )
 
-                    pending_ids = pending_ids[batch_size:]
+                    pending_items = pending_items[batch_size:]
                     self.consecutive_rate_limits = 0
                     batch_size_idx = 0
 
-                    if pending_ids:
+                    if pending_items:
                         await asyncio.sleep(BATCH_DELAY_SECONDS)
                 else:
                     error_msg = batch_result.error or ""
@@ -858,7 +1114,7 @@ class AccountClaimer:
                             logger.info(
                                 f"[{self.name}] All keys rate limited, stopping cycle"
                             )
-                            for cid in pending_ids:
+                            for cid, _ in pending_items:
                                 self.stats.total_failed += 1
                                 results.append(
                                     ClaimResult(
@@ -879,7 +1135,7 @@ class AccountClaimer:
                     else:
                         logger.error(
                             f"[{self.name}] All batch sizes exhausted, "
-                            f"marking {len(batch_ids)} as failed"
+                            f"marking {len(batch_items)} as failed"
                         )
                         for cid in batch_ids:
                             self.stats.total_failed += 1
@@ -890,13 +1146,22 @@ class AccountClaimer:
                                     error=error_msg,
                                 )
                             )
-                        pending_ids = pending_ids[len(batch_ids) :]
+                        pending_items = pending_items[len(batch_items):]
                         batch_size_idx = 0
 
             claimed = sum(1 for r in results if r.success)
             failed = sum(1 for r in results if not r.success)
 
-            # Balance after claim — verify USDC.e increased
+            # Balance after claim — verify collateral increased.
+            # NOTE: SDK-reported balance is V2 COLLATERAL (= pUSD post-cutover);
+            # USDC.e-collateralized markets pay out USDC.e on-chain instead and
+            # won't move the pUSD balance. So we sanity-check only against the
+            # pUSD-collateralized portion of the batch.
+            pusd_expected = sum(
+                pos.payout_amount
+                for pos in claimable
+                if pos.collateral.lower() == PUSD_ADDRESS.lower()
+            )
             balance_after = None
             if claimed > 0 and balance_before is not None:
                 await asyncio.sleep(2)  # brief wait for settlement
@@ -904,13 +1169,13 @@ class AccountClaimer:
                 if balance_after is not None:
                     diff = balance_after - balance_before
                     logger.info(
-                        f"[{self.name}] USDC.e after claim: ${balance_after:.2f} "
-                        f"(+${diff:.2f})"
+                        f"[{self.name}] collateral after claim: ${balance_after:.2f} "
+                        f"(+${diff:.2f}, pUSD-expected=${pusd_expected:.2f})"
                     )
-                    if diff < total_amount * 0.5:
+                    if pusd_expected > 0 and diff < pusd_expected * 0.5:
                         logger.warning(
-                            f"[{self.name}] Balance increase ${diff:.2f} < "
-                            f"expected ${total_amount:.2f} — verify on-chain"
+                            f"[{self.name}] pUSD balance increase ${diff:.2f} < "
+                            f"expected ${pusd_expected:.2f} — verify on-chain"
                         )
 
             logger.info(
@@ -922,7 +1187,7 @@ class AccountClaimer:
                 msg = f"CLAIM: {claimed} position(s) claimed"
                 if balance_before is not None and balance_after is not None:
                     msg += (
-                        f"\nUSDC.e: ${balance_before:.2f} → ${balance_after:.2f} "
+                        f"\nCollateral: ${balance_before:.2f} → ${balance_after:.2f} "
                         f"(+${balance_after - balance_before:.2f})"
                     )
                 await tg_send(msg)
@@ -931,6 +1196,42 @@ class AccountClaimer:
             logger.error(f"[{self.name}] Cycle error: {e}")
 
         return results
+
+    async def _wrap_pending_usdc_e(self) -> None:
+        """Wrap any USDC.e sitting in the Safe to pUSD via Onramp.wrap.
+
+        V1-collateralized redeems pay out USDC.e on-chain; until wrapped, the
+        Polymarket UI shows "Activate Funds" and the funds aren't tradable as
+        V2 collateral. Always wrap the full balance to keep the Safe in pUSD.
+        """
+        try:
+            usdc_e_raw = await self.detector.resolver.get_erc20_balance(
+                USDC_E_ADDRESS, self.config.proxy_address
+            )
+        except Exception as e:
+            logger.warning(f"[{self.name}] USDC.e balance check failed: {e}")
+            return
+
+        if usdc_e_raw <= 0:
+            return
+
+        usdc_e_human = usdc_e_raw / 1e6
+        logger.info(
+            f"[{self.name}] Wrapping ${usdc_e_human:.2f} USDC.e -> pUSD..."
+        )
+        wrap_result = await self.executor.wrap_usdc_to_pusd(
+            self.config.proxy_address, usdc_e_raw
+        )
+        if wrap_result.get("success"):
+            logger.info(
+                f"[{self.name}] Wrap SUCCESS: ${usdc_e_human:.2f} -> pUSD, "
+                f"tx={wrap_result.get('tx_hash')}"
+            )
+            await tg_send(f"WRAP: ${usdc_e_human:.2f} USDC.e → pUSD")
+        else:
+            logger.warning(
+                f"[{self.name}] Wrap FAILED: {wrap_result.get('error')}"
+            )
 
     async def close(self):
         await self.detector.close()
